@@ -1,0 +1,12 @@
+# Основные зависимости
+opencv-python
+#opencv-contrib-python
+numpy
+#numpy<2.0.0
+pyFirmata2
+
+# Raspberry Pi Camera
+python3-picamera2
+
+# Time of Flight Camera
+ArducamDepthCamera
