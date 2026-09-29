@@ -3,10 +3,13 @@ opencv-python
 #opencv-contrib-python
 numpy
 #numpy<2.0.0
-pyFirmata2
+opencv-python
 
 # Raspberry Pi Camera
 python3-picamera2
 
 # Time of Flight Camera
 ArducamDepthCamera
+
+# Arduino
+pyFirmata2
