@@ -37,6 +37,9 @@ def get_ports():
         print("-" * 30)
 
 
+get_ports()
+
+
 def clamp(angle, min_angle, max_angle):
     return max(min_angle, min(angle, max_angle))
 
