@@ -52,6 +52,7 @@ def main():
     time.sleep(5)
     picam2.title_fields = ["ExposureTime", "AnalogueGain"]
 
+    # Получаем metadata текущего кадра
     # picam2.capture_metadata()["FrameDuration"]
     # picam2.capture_metadata()["SensorTimestamp"]
     metadata = Metadata(picam2.capture_metadata())

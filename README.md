@@ -144,3 +144,13 @@ pip install --upgrade pip
 pip install wheel
 pip install rpi-libcamera rpi-kms picamera2
 ```
+
+# You can check that libcamera is working by opening a command window and typing:
+```
+rpicam-hello
+```
+
+```
+rpicam-hello --list-cameras
+```
+
