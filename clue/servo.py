@@ -1,4 +1,5 @@
 import pyfirmata2
+import serial
 import time
 
 # Порт Arduino
@@ -14,6 +15,26 @@ SERVO1_MAX = 160
 
 SERVO2_MIN = 30
 SERVO2_MAX = 150
+
+
+def get_ports():
+    ports = serial.tools.list_ports.comports()
+
+    if not ports:
+        print("No serial ports found.")
+        return
+
+    for port in ports:
+        print(f"Device: {port.device}")
+        print(f"Description: {port.description}")
+        print(f"Hardware ID: {port.hwid}")
+        if port.manufacturer:
+            print(f"Manufacturer: {port.manufacturer}")
+        if port.product:
+            print(f"Product: {port.product}")
+        if port.serial_number:
+            print(f"Serial Number: {port.serial_number}")
+        print("-" * 30)
 
 
 def clamp(angle, min_angle, max_angle):
