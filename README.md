@@ -93,3 +93,54 @@ python --version
 ```
 which python
 ```
+
+## Для обновления программного обеспечения ArduCam ToF в /boot/firmware/config.txt:
+```
+[all]
+# Disable automatic camera detection
+camera_auto_detect=0
+# Enable the IMX219 camera on cam0
+dtoverlay=imx219,cam0
+# Enable the Arducam Pivariety camera on cam1
+dtoverlay=arducam-pivariety,cam1
+```
+
+In the example Python code, the only change I made was in this function:
+```
+	ac.TOFConnect.CSI, ac.TOFOutput.DEPTH, 0)
+	ret = cam.open(ac.Connection.CSI, 0)
+```
+
+Исправление ошибок при старте камеры (errors and warnings)
+```
+wget -O install_pivariety_pkgs.sh https://github.com/ArduCAM/Arducam-Pivariety-V4L2-Driver/releases/download/install_script/install_pivariety_pkgs.sh
+chmod +x install_pivariety_pkgs.sh
+./install_pivariety_pkgs.sh -p libcamera_dev
+./install_pivariety_pkgs.sh -p libcamera_apps
+```
+
+```
+sudo apt-mark manual qtbase5-dev qtchooser qt5-qmake qtbase5-dev-tools
+sudo apt install qtbase5-dev qtchooser qt5-qmake qtbase5-dev-tools
+pip3 install --verbose pyqt6==6.3.0
+pip3 install pyqt5 --config-settings --confirm-license= --verbose
+pip install PyOpenGL
+```
+
+Для установки PiCamera2 в виртуальном пространстве:
+Running on Bookworm, use the following commands to install the prequisites
+```
+sudo apt update && sudo apt upgrade
+```
+
+все:
+```
+sudo apt install libcap-dev libatlas-base-dev ffmpeg libopenjp2-7 libcamera-dev libkms++-dev libfmt-dev libdrm-dev
+```
+
+Then activate your virtual environment and run the following commands
+```
+pip install --upgrade pip
+pip install wheel
+pip install rpi-libcamera rpi-kms picamera2
+```
