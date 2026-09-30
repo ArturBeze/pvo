@@ -4,6 +4,7 @@ opencv-python
 numpy
 #numpy<2.0.0
 opencv-python
+pillow
 
 # Raspberry Pi Camera
 python3-picamera2
