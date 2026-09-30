@@ -747,56 +747,25 @@ class CameraWorker(threading.Thread):
 
 
 class ToFTrackerApp(tk.Tk):
+    # Explicit UI colours avoid broken/invisible ttk foreground/background combinations
+    # on some Raspberry Pi OS Wayland/labwc desktop themes.
+    UI_BG = "#f0f0f0"
+    UI_FG = "#101010"
+    UI_FIELD_BG = "#ffffff"
+    UI_TROUGH = "#d0d0d0"
+    UI_ACTIVE = "#c0c0c0"
+
     def __init__(self) -> None:
         super().__init__()
 
-        # На Raspberry Pi OS / Wayland системная ttk-тема
-        # иногда неправильно перерисовывает виджеты.
-        style = ttk.Style(self)
-
-        if "clam" in style.theme_names():
-            style.theme_use("clam")
-
-        bg = "#f0f0f0"
-        fg = "#101010"
-
-        self.configure(background=bg)
-
-        style.configure(
-            "TFrame",
-            background=bg,
-        )
-
-        style.configure(
-            "TLabelframe",
-            background=bg,
-        )
-
-        style.configure(
-            "TLabelframe.Label",
-            background=bg,
-            foreground=fg,
-        )
-
-        style.configure(
-            "TLabel",
-            background=bg,
-            foreground=fg,
-        )
-
-        style.configure(
-            "TButton",
-            foreground=fg,
-            padding=6,
-        )
-
-        style.configure(
-            "TSpinbox",
-            foreground=fg,
-        )
+        # Raspberry Pi OS + Wayland/labwc can occasionally fail to paint widgets
+        # correctly with the desktop-provided ttk theme.  "clam" is rendered by Tk
+        # itself and is considerably more predictable across Pi OS installations.
+        self._configure_tk_theme()
 
         self.title("Arducam ToF — ближайший устойчивый объект")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.configure(background=self.UI_BG)
 
         self.settings = SharedSettings(TrackerConfig())
         self.frame_queue: queue.Queue = queue.Queue(maxsize=1)
@@ -807,8 +776,66 @@ class ToFTrackerApp(tk.Tk):
         self._closing = False
 
         self._build_ui()
+
+        # Force geometry calculation and an initial paint before the camera worker
+        # begins delivering frames.  This prevents the "appears only on hover" symptom
+        # seen with some Pi desktop/Wayland combinations.
+        self.update_idletasks()
+        self.after_idle(self._force_initial_redraw)
+        self.after(120, self._force_initial_redraw)
+
         self.worker.start()
         self.after(15, self._poll)
+
+    def _configure_tk_theme(self) -> None:
+        style = ttk.Style(self)
+
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+
+        style.configure("TFrame", background=self.UI_BG)
+        style.configure("TLabelframe", background=self.UI_BG)
+        style.configure(
+            "TLabelframe.Label",
+            background=self.UI_BG,
+            foreground=self.UI_FG,
+        )
+        style.configure(
+            "TLabel",
+            background=self.UI_BG,
+            foreground=self.UI_FG,
+        )
+        style.configure(
+            "TButton",
+            foreground=self.UI_FG,
+            padding=6,
+        )
+        style.map(
+            "TButton",
+            foreground=[("disabled", "#777777"), ("active", self.UI_FG)],
+        )
+        style.configure(
+            "TSpinbox",
+            foreground=self.UI_FG,
+            fieldbackground=self.UI_FIELD_BG,
+        )
+        style.map(
+            "TSpinbox",
+            foreground=[("disabled", "#777777"), ("!disabled", self.UI_FG)],
+            fieldbackground=[("readonly", self.UI_FIELD_BG), ("!disabled", self.UI_FIELD_BG)],
+        )
+
+    def _force_initial_redraw(self) -> None:
+        if self._closing:
+            return
+        try:
+            self.update_idletasks()
+            # Generate an expose event for the top-level and its children.  The event
+            # is harmless on X11 and helps labwc/Wayland request a repaint immediately.
+            self.event_generate("<Expose>", when="tail")
+        except tk.TclError:
+            # Window may already be closing.
+            pass
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=10)
@@ -845,15 +872,6 @@ class ToFTrackerApp(tk.Tk):
         row = 0
         ttk.Label(controls, text="Нижняя граница, мм").grid(row=row, column=0, sticky="w", padx=8, pady=(8, 0))
         row += 1
-        # tk.Scale(
-        #     controls,
-        #     from_=50,
-        #     to=CAMERA_RANGE_MM - 50,
-        #     resolution=10,
-        #     orient=tk.HORIZONTAL,
-        #     length=270,
-        #     variable=self.min_distance,
-        # ).grid(row=row, column=0, sticky="ew", padx=8)
         tk.Scale(
             controls,
             from_=50,
@@ -862,41 +880,32 @@ class ToFTrackerApp(tk.Tk):
             orient=tk.HORIZONTAL,
             length=270,
             variable=self.min_distance,
-
-            bg="#f0f0f0",
-            fg="#101010",
+            bg=self.UI_BG,
+            fg=self.UI_FG,
+            activebackground=self.UI_ACTIVE,
+            troughcolor=self.UI_TROUGH,
             highlightthickness=0,
-            troughcolor="#d0d0d0",
-            activebackground="#c0c0c0",
-        )
+            bd=0,
+        ).grid(row=row, column=0, sticky="ew", padx=8)
 
         row += 1
         ttk.Label(controls, text="Верхняя граница, мм").grid(row=row, column=0, sticky="w", padx=8, pady=(6, 0))
         row += 1
-        # tk.Scale(
-        #     controls,
-        #     from_=100,
-        #     to=CAMERA_RANGE_MM,
-        #     resolution=10,
-        #     orient=tk.HORIZONTAL,
-        #     length=270,
-        #     variable=self.max_distance,
-        # ).grid(row=row, column=0, sticky="ew", padx=8)
         tk.Scale(
             controls,
-            from_=50,
-            to=CAMERA_RANGE_MM - 50,
+            from_=100,
+            to=CAMERA_RANGE_MM,
             resolution=10,
             orient=tk.HORIZONTAL,
             length=270,
-            variable=self.min_distance,
-
-            bg="#f0f0f0",
-            fg="#101010",
+            variable=self.max_distance,
+            bg=self.UI_BG,
+            fg=self.UI_FG,
+            activebackground=self.UI_ACTIVE,
+            troughcolor=self.UI_TROUGH,
             highlightthickness=0,
-            troughcolor="#d0d0d0",
-            activebackground="#c0c0c0",
-        )
+            bd=0,
+        ).grid(row=row, column=0, sticky="ew", padx=8)
 
         row += 1
         sep = ttk.Separator(controls)
