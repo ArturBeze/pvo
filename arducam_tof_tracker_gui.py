@@ -749,6 +749,52 @@ class CameraWorker(threading.Thread):
 class ToFTrackerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+
+        # На Raspberry Pi OS / Wayland системная ttk-тема
+        # иногда неправильно перерисовывает виджеты.
+        style = ttk.Style(self)
+
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+
+        bg = "#f0f0f0"
+        fg = "#101010"
+
+        self.configure(background=bg)
+
+        style.configure(
+            "TFrame",
+            background=bg,
+        )
+
+        style.configure(
+            "TLabelframe",
+            background=bg,
+        )
+
+        style.configure(
+            "TLabelframe.Label",
+            background=bg,
+            foreground=fg,
+        )
+
+        style.configure(
+            "TLabel",
+            background=bg,
+            foreground=fg,
+        )
+
+        style.configure(
+            "TButton",
+            foreground=fg,
+            padding=6,
+        )
+
+        style.configure(
+            "TSpinbox",
+            foreground=fg,
+        )
+
         self.title("Arducam ToF — ближайший устойчивый объект")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -799,6 +845,15 @@ class ToFTrackerApp(tk.Tk):
         row = 0
         ttk.Label(controls, text="Нижняя граница, мм").grid(row=row, column=0, sticky="w", padx=8, pady=(8, 0))
         row += 1
+        # tk.Scale(
+        #     controls,
+        #     from_=50,
+        #     to=CAMERA_RANGE_MM - 50,
+        #     resolution=10,
+        #     orient=tk.HORIZONTAL,
+        #     length=270,
+        #     variable=self.min_distance,
+        # ).grid(row=row, column=0, sticky="ew", padx=8)
         tk.Scale(
             controls,
             from_=50,
@@ -807,20 +862,41 @@ class ToFTrackerApp(tk.Tk):
             orient=tk.HORIZONTAL,
             length=270,
             variable=self.min_distance,
-        ).grid(row=row, column=0, sticky="ew", padx=8)
+
+            bg="#f0f0f0",
+            fg="#101010",
+            highlightthickness=0,
+            troughcolor="#d0d0d0",
+            activebackground="#c0c0c0",
+        )
 
         row += 1
         ttk.Label(controls, text="Верхняя граница, мм").grid(row=row, column=0, sticky="w", padx=8, pady=(6, 0))
         row += 1
+        # tk.Scale(
+        #     controls,
+        #     from_=100,
+        #     to=CAMERA_RANGE_MM,
+        #     resolution=10,
+        #     orient=tk.HORIZONTAL,
+        #     length=270,
+        #     variable=self.max_distance,
+        # ).grid(row=row, column=0, sticky="ew", padx=8)
         tk.Scale(
             controls,
-            from_=100,
-            to=CAMERA_RANGE_MM,
+            from_=50,
+            to=CAMERA_RANGE_MM - 50,
             resolution=10,
             orient=tk.HORIZONTAL,
             length=270,
-            variable=self.max_distance,
-        ).grid(row=row, column=0, sticky="ew", padx=8)
+            variable=self.min_distance,
+
+            bg="#f0f0f0",
+            fg="#101010",
+            highlightthickness=0,
+            troughcolor="#d0d0d0",
+            activebackground="#c0c0c0",
+        )
 
         row += 1
         sep = ttk.Separator(controls)
