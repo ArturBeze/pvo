@@ -14,7 +14,7 @@ GUI:
 Image handling:
   - OpenCV + Pillow
 Arduino link:
-  - pyFirmata2
+  - pyFirmata2 + pyserial port discovery
 
 Design goals:
   - Tkinter runs only in the main thread.
@@ -39,6 +39,7 @@ from tkinter import messagebox, ttk
 from PIL import Image, ImageTk
 
 import pyfirmata2
+from serial.tools import list_ports
 import ArducamDepthCamera as ac
 
 
@@ -62,6 +63,42 @@ def clamp(value: float, lo: float, hi: float) -> float:
 
 def finite_or(value: float, fallback: float = 0.0) -> float:
     return float(value) if math.isfinite(float(value)) else fallback
+
+
+def serial_port_score(port) -> int:
+    """Score serial devices so the most likely Arduino is selected first."""
+    device = (getattr(port, "device", "") or "").lower()
+    description = (getattr(port, "description", "") or "").lower()
+    manufacturer = (getattr(port, "manufacturer", "") or "").lower()
+    product = (getattr(port, "product", "") or "").lower()
+    text = " ".join((device, description, manufacturer, product))
+    vid = getattr(port, "vid", None)
+
+    score = 0
+    # Official Arduino/Genuino USB vendor IDs.
+    if vid in (0x2341, 0x2A03):
+        score += 1000
+    if "arduino" in text or "genuino" in text:
+        score += 700
+
+    # On Linux/Raspberry Pi an Uno commonly enumerates as ttyACM*.
+    if device.startswith("/dev/ttyacm"):
+        score += 400
+    elif device.startswith("/dev/ttyusb"):
+        score += 250
+
+    # Common USB-to-serial bridges used by Arduino-compatible boards/clones.
+    for token in ("ch340", "ch341", "cp210", "ftdi", "usb serial", "usb-serial"):
+        if token in text:
+            score += 120
+            break
+
+    # De-prioritize ports that are very unlikely to be the gimbal controller.
+    for token in ("bluetooth", "rfcomm", "debug", "console"):
+        if token in text:
+            score -= 500
+
+    return score
 
 
 @dataclass
@@ -979,11 +1016,17 @@ class TrackerApp:
         self.telemetry_var = tk.StringVar(value="Система не запущена")
         self.error_var = tk.StringVar(value="")
         self.control_mode_var = tk.StringVar(value="AUTO")
+        self.arduino_port_info_var = tk.StringVar(value="Порты ещё не просканированы")
+        self.arduino_port_combo: Optional[ttk.Combobox] = None
+        self._serial_ports_by_device = {}
         self.manual_buttons: List[ttk.Button] = []
         self._pressed_manual_keys = set()
 
         self._build_ui()
         self._load_config_to_ui(self.shared.get_config())
+        # Populate the selector after widgets and StringVars exist. Prefer a
+        # detected Arduino over the hard-coded fallback /dev/ttyACM0.
+        self.refresh_arduino_ports(auto_select=True)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._bind_manual_keyboard()
         self.root.after(50, self._ui_tick)
@@ -1091,28 +1134,126 @@ class TrackerApp:
         self._entry(pred, 3, "Max XY speed, px/s", "max_pixel_speed_px_s")
         self._entry(pred, 4, "Max Z speed, m/s", "max_depth_speed_m_s")
 
-        self._entry(servo, 0, "Arduino port", "arduino_port")
-        self._entry(servo, 1, "X min", "servo_x_min")
-        self._entry(servo, 2, "X max", "servo_x_max")
-        self._entry(servo, 3, "Y min", "servo_y_min")
-        self._entry(servo, 4, "Y max", "servo_y_max")
-        self._entry(servo, 5, "Gain X, deg/s", "servo_gain_x_deg_s")
-        self._entry(servo, 6, "Gain Y, deg/s", "servo_gain_y_deg_s")
-        self._entry(servo, 7, "Max slew, deg/s", "servo_max_rate_deg_s")
-        self._entry(servo, 8, "Servo update, Hz", "servo_update_hz")
-        self._entry(servo, 9, "Deadband, px", "deadband_px")
-        self._entry(servo, 10, "Center delay, s", "return_center_delay_s")
-        self._entry(servo, 11, "Manual step, deg", "manual_step_deg")
-        self._entry(servo, 12, "Manual speed, deg/s", "manual_rate_deg_s")
+        self._arduino_port_selector(servo, 0)
+        ttk.Label(
+            servo, textvariable=self.arduino_port_info_var, wraplength=330, justify="left"
+        ).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 5))
 
-        self._check(servo, 13, "Servo control", "servo_enabled")
-        self._check(servo, 14, "Invert X", "invert_x")
-        self._check(servo, 15, "Invert Y", "invert_y")
-        self._check(servo, 16, "Центрировать при потере", "return_center_on_loss")
+        self._entry(servo, 2, "X min", "servo_x_min")
+        self._entry(servo, 3, "X max", "servo_x_max")
+        self._entry(servo, 4, "Y min", "servo_y_min")
+        self._entry(servo, 5, "Y max", "servo_y_max")
+        self._entry(servo, 6, "Gain X, deg/s", "servo_gain_x_deg_s")
+        self._entry(servo, 7, "Gain Y, deg/s", "servo_gain_y_deg_s")
+        self._entry(servo, 8, "Max slew, deg/s", "servo_max_rate_deg_s")
+        self._entry(servo, 9, "Servo update, Hz", "servo_update_hz")
+        self._entry(servo, 10, "Deadband, px", "deadband_px")
+        self._entry(servo, 11, "Center delay, s", "return_center_delay_s")
+        self._entry(servo, 12, "Manual step, deg", "manual_step_deg")
+        self._entry(servo, 13, "Manual speed, deg/s", "manual_rate_deg_s")
+
+        self._check(servo, 14, "Servo control", "servo_enabled")
+        self._check(servo, 15, "Invert X", "invert_x")
+        self._check(servo, 16, "Invert Y", "invert_y")
+        self._check(servo, 17, "Центрировать при потере", "return_center_on_loss")
 
         error = ttk.LabelFrame(right, text="Диагностика", padding=8)
         error.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         ttk.Label(error, textvariable=self.error_var, wraplength=350, justify="left").pack(fill="x")
+
+    def _arduino_port_selector(self, parent, row: int) -> None:
+        """Editable selector: detected ports are listed, but manual entry is allowed."""
+        parent.columnconfigure(1, weight=1)
+        ttk.Label(parent, text="Arduino port").grid(
+            row=row, column=0, sticky="w", pady=2, padx=(0, 8)
+        )
+        var = tk.StringVar(value=ARDUINO_DEFAULT_PORT)
+        self.vars["arduino_port"] = var
+        self.arduino_port_combo = ttk.Combobox(
+            parent, textvariable=var, state="normal", width=22
+        )
+        self.arduino_port_combo.grid(row=row, column=1, sticky="ew", pady=2)
+        self.arduino_port_combo.bind("<<ComboboxSelected>>", self._on_arduino_port_selected)
+        ttk.Button(parent, text="Обновить / авто", command=self.refresh_arduino_ports).grid(
+            row=row, column=2, sticky="ew", padx=(6, 0), pady=2
+        )
+
+    @staticmethod
+    def _port_description(port) -> str:
+        parts = []
+        description = (getattr(port, "description", "") or "").strip()
+        manufacturer = (getattr(port, "manufacturer", "") or "").strip()
+        product = (getattr(port, "product", "") or "").strip()
+        if description and description.lower() != "n/a":
+            parts.append(description)
+        if manufacturer and manufacturer.lower() not in " ".join(parts).lower():
+            parts.append(manufacturer)
+        if product and product.lower() not in " ".join(parts).lower():
+            parts.append(product)
+        return " / ".join(parts) if parts else "неизвестное USB/serial устройство"
+
+    def _on_arduino_port_selected(self, _event=None) -> None:
+        device = str(self.vars["arduino_port"].get()).strip()
+        port = self._serial_ports_by_device.get(device)
+        if port is None:
+            self.arduino_port_info_var.set(f"Выбран порт: {device} (введён вручную)")
+            return
+        self.arduino_port_info_var.set(
+            f"Выбран: {device} — {self._port_description(port)}"
+        )
+
+    def refresh_arduino_ports(self, auto_select: bool = False) -> None:
+        """Rescan serial ports and optionally choose the most likely Arduino."""
+        try:
+            ports = list(list_ports.comports())
+        except Exception as exc:
+            self.arduino_port_info_var.set(f"Ошибка сканирования serial-портов: {exc}")
+            return
+
+        ports.sort(key=lambda p: (-serial_port_score(p), str(getattr(p, "device", ""))))
+        self._serial_ports_by_device = {p.device: p for p in ports if getattr(p, "device", None)}
+        devices = list(self._serial_ports_by_device)
+        if self.arduino_port_combo is not None:
+            self.arduino_port_combo.configure(values=devices)
+
+        current = str(self.vars["arduino_port"].get()).strip()
+        selected = current
+
+        best_is_plausible = bool(ports) and (serial_port_score(ports[0]) > 0 or len(ports) == 1)
+        if auto_select:
+            # At startup, prefer a detected likely Arduino instead of assuming ttyACM0.
+            if best_is_plausible:
+                selected = ports[0].device
+        elif current not in self._serial_ports_by_device:
+            # After unplug/replug the Linux device index can change (ACM0 -> ACM1).
+            # Automatically recover when there is a plausible replacement.
+            if best_is_plausible:
+                selected = ports[0].device
+            elif not current:
+                selected = ARDUINO_DEFAULT_PORT
+
+        if selected:
+            self.vars["arduino_port"].set(selected)
+
+        if not ports:
+            self.arduino_port_info_var.set(
+                "Serial-порты не найдены. Можно ввести путь вручную и нажать Старт."
+            )
+            return
+
+        best = ports[0]
+        selected_port = self._serial_ports_by_device.get(selected)
+        if selected_port is not None:
+            prefix = "Автовыбор" if auto_select else "Выбран"
+            self.arduino_port_info_var.set(
+                f"{prefix}: {selected_port.device} — {self._port_description(selected_port)}; "
+                f"найдено портов: {len(ports)}"
+            )
+        else:
+            self.arduino_port_info_var.set(
+                f"Найдено портов: {len(ports)}. Наиболее вероятный Arduino: "
+                f"{best.device} — {self._port_description(best)}"
+            )
 
     def _entry(self, parent, row: int, label: str, key: str) -> None:
         parent.columnconfigure(1, weight=1)
@@ -1346,6 +1487,16 @@ class TrackerApp:
     def start_system(self) -> None:
         if self.worker is not None and self.worker.is_alive():
             return
+        # Refresh immediately before connecting so unplug/replug or ttyACM index
+        # changes do not require restarting the GUI. Keep an explicit manual
+        # selection if it still exists; otherwise choose the best detected port.
+        current_port = str(self.vars["arduino_port"].get()).strip()
+        try:
+            detected_now = {p.device for p in list_ports.comports()}
+        except Exception:
+            detected_now = set()
+        if not current_port or (current_port.startswith("/dev/") and current_port not in detected_now):
+            self.refresh_arduino_ports(auto_select=True)
         try:
             cfg = self._read_config_from_ui()
             self.shared.set_config(cfg)
