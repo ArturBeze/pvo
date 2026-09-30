@@ -5,6 +5,7 @@ numpy
 #numpy<2.0.0
 opencv-python
 pillow
+tkinter
 
 # Raspberry Pi Camera
 python3-picamera2
