@@ -30,6 +30,7 @@ def main():
 
 
     # camera_config = picam2.create_still_configuration(main={"size": (1920, 1080)}, lores={"size": (640, 480)}, display="lores")
+    # picam2.configure(camera_config)
 
 
     # video_config = picam2.create_video_configuration(main={"size": (1640, 1232)}, controls={"FrameDurationLimits": (40000, 40000)}, lores={"size": (640, 480)})
