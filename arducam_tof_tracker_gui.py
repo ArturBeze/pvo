@@ -30,7 +30,7 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox
 from PIL import Image, ImageTk
 
 import ArducamDepthCamera as ac
@@ -747,25 +747,49 @@ class CameraWorker(threading.Thread):
 
 
 class ToFTrackerApp(tk.Tk):
-    # Explicit UI colours avoid broken/invisible ttk foreground/background combinations
-    # on some Raspberry Pi OS Wayland/labwc desktop themes.
-    UI_BG = "#f0f0f0"
-    UI_FG = "#101010"
+    """
+    GUI intentionally uses only classic tkinter widgets (tk.*), not ttk.
+
+    This avoids theme-engine repaint problems seen on Raspberry Pi OS when Tk
+    runs through XWayland/labwc.  All colours are explicit and the top-level is
+    mapped only after the complete widget tree has been built.
+    """
+
+    UI_BG = "#ececec"
+    UI_PANEL_BG = "#f4f4f4"
+    UI_FG = "#111111"
     UI_FIELD_BG = "#ffffff"
-    UI_TROUGH = "#d0d0d0"
-    UI_ACTIVE = "#c0c0c0"
+    UI_BUTTON_BG = "#e2e2e2"
+    UI_BUTTON_ACTIVE = "#d0d0d0"
+    UI_TROUGH = "#c8c8c8"
+    UI_BORDER = "#8a8a8a"
 
     def __init__(self) -> None:
         super().__init__()
 
-        # Raspberry Pi OS + Wayland/labwc can occasionally fail to paint widgets
-        # correctly with the desktop-provided ttk theme.  "clam" is rendered by Tk
-        # itself and is considerably more predictable across Pi OS installations.
-        self._configure_tk_theme()
+        # Do not let the compositor paint a half-constructed window.  Build the
+        # whole interface while withdrawn and map it only when geometry is ready.
+        self.withdraw()
 
         self.title("Arducam ToF — ближайший устойчивый объект")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.configure(background=self.UI_BG)
+
+        # Global palette for classic Tk widgets.  Individual widgets below also
+        # receive explicit colours, so the desktop theme cannot make text blend
+        # into the background.
+        try:
+            self.tk_setPalette(
+                background=self.UI_BG,
+                foreground=self.UI_FG,
+                activeBackground=self.UI_BUTTON_ACTIVE,
+                activeForeground=self.UI_FG,
+                highlightColor=self.UI_BORDER,
+                selectBackground="#b8d6f0",
+                selectForeground=self.UI_FG,
+            )
+        except tk.TclError:
+            pass
 
         self.settings = SharedSettings(TrackerConfig())
         self.frame_queue: queue.Queue = queue.Queue(maxsize=1)
@@ -774,87 +798,117 @@ class ToFTrackerApp(tk.Tk):
 
         self._photo: Optional[ImageTk.PhotoImage] = None
         self._closing = False
+        self._initial_repaints_left = 10
 
         self._build_ui()
 
-        # Force geometry calculation and an initial paint before the camera worker
-        # begins delivering frames.  This prevents the "appears only on hover" symptom
-        # seen with some Pi desktop/Wayland combinations.
+        # Calculate geometry before showing the window, then force an immediate
+        # complete paint.  This is more reliable under XWayland than relying on
+        # the first Expose event.
         self.update_idletasks()
-        self.after_idle(self._force_initial_redraw)
-        self.after(120, self._force_initial_redraw)
+        self.deiconify()
+        self.lift()
+        self.update_idletasks()
+        try:
+            self.update()
+        except tk.TclError:
+            pass
+
+        # Repaint on compositor/window-manager events and for a short period after
+        # startup.  This does not depend on hover/active widget states.
+        self.bind("<Map>", self._on_window_repaint_event, add="+")
+        self.bind("<Visibility>", self._on_window_repaint_event, add="+")
+        self.bind("<Configure>", self._on_window_repaint_event, add="+")
+        self.after(50, self._startup_repaint)
 
         self.worker.start()
         self.after(15, self._poll)
 
-    def _configure_tk_theme(self) -> None:
-        style = ttk.Style(self)
+    def _classic_frame(self, parent, **kwargs):
+        return tk.Frame(parent, bg=self.UI_BG, **kwargs)
 
-        if "clam" in style.theme_names():
-            style.theme_use("clam")
+    def _classic_label(self, parent, **kwargs):
+        kwargs.setdefault("bg", self.UI_BG)
+        kwargs.setdefault("fg", self.UI_FG)
+        return tk.Label(parent, **kwargs)
 
-        style.configure("TFrame", background=self.UI_BG)
-        style.configure("TLabelframe", background=self.UI_BG)
-        style.configure(
-            "TLabelframe.Label",
-            background=self.UI_BG,
-            foreground=self.UI_FG,
-        )
-        style.configure(
-            "TLabel",
-            background=self.UI_BG,
-            foreground=self.UI_FG,
-        )
-        style.configure(
-            "TButton",
-            foreground=self.UI_FG,
-            padding=6,
-        )
-        style.map(
-            "TButton",
-            foreground=[("disabled", "#777777"), ("active", self.UI_FG)],
-        )
-        style.configure(
-            "TSpinbox",
-            foreground=self.UI_FG,
-            fieldbackground=self.UI_FIELD_BG,
-        )
-        style.map(
-            "TSpinbox",
-            foreground=[("disabled", "#777777"), ("!disabled", self.UI_FG)],
-            fieldbackground=[("readonly", self.UI_FIELD_BG), ("!disabled", self.UI_FIELD_BG)],
+    def _classic_labelframe(self, parent, **kwargs):
+        return tk.LabelFrame(
+            parent,
+            bg=self.UI_BG,
+            fg=self.UI_FG,
+            bd=1,
+            relief=tk.GROOVE,
+            highlightthickness=0,
+            **kwargs,
         )
 
-    def _force_initial_redraw(self) -> None:
+    def _classic_button(self, parent, **kwargs):
+        return tk.Button(
+            parent,
+            bg=self.UI_BUTTON_BG,
+            fg=self.UI_FG,
+            activebackground=self.UI_BUTTON_ACTIVE,
+            activeforeground=self.UI_FG,
+            disabledforeground="#777777",
+            relief=tk.RAISED,
+            bd=1,
+            highlightthickness=1,
+            highlightbackground=self.UI_BORDER,
+            highlightcolor=self.UI_BORDER,
+            padx=8,
+            pady=5,
+            **kwargs,
+        )
+
+    def _force_full_redraw(self) -> None:
         if self._closing:
             return
         try:
+            # Ask every classic Tk widget to recompute and repaint itself.
+            for widget in self.winfo_children():
+                widget.update_idletasks()
             self.update_idletasks()
-            # Generate an expose event for the top-level and its children.  The event
-            # is harmless on X11 and helps labwc/Wayland request a repaint immediately.
-            self.event_generate("<Expose>", when="tail")
         except tk.TclError:
-            # Window may already be closing.
             pass
 
+    def _on_window_repaint_event(self, _event=None) -> None:
+        if not self._closing:
+            self.after_idle(self._force_full_redraw)
+
+    def _startup_repaint(self) -> None:
+        if self._closing or self._initial_repaints_left <= 0:
+            return
+        self._force_full_redraw()
+        self._initial_repaints_left -= 1
+        self.after(100, self._startup_repaint)
+
     def _build_ui(self) -> None:
-        root = ttk.Frame(self, padding=10)
+        root = tk.Frame(self, bg=self.UI_BG, padx=10, pady=10)
         root.grid(row=0, column=0, sticky="nsew")
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
         root.rowconfigure(0, weight=1)
         root.columnconfigure(0, weight=1)
 
-        preview_frame = ttk.LabelFrame(root, text="Depth / tracking")
+        preview_frame = self._classic_labelframe(root, text="Depth / tracking")
         preview_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         preview_frame.rowconfigure(0, weight=1)
         preview_frame.columnconfigure(0, weight=1)
 
-        self.preview_label = ttk.Label(preview_frame, anchor="center")
+        self.preview_label = tk.Label(
+            preview_frame,
+            bg="#000000",
+            fg="#ffffff",
+            anchor="center",
+            bd=0,
+            highlightthickness=0,
+        )
         self.preview_label.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
 
-        controls = ttk.LabelFrame(root, text="Параметры")
+        controls = self._classic_labelframe(root, text="Параметры")
         controls.grid(row=0, column=1, sticky="ns")
+        controls.columnconfigure(0, weight=1)
 
         cfg = self.settings.get()
         self.min_distance = tk.DoubleVar(value=cfg.min_distance_mm)
@@ -870,7 +924,9 @@ class ToFTrackerApp(tk.Tk):
         self.prediction_frames = tk.IntVar(value=cfg.prediction_frames)
 
         row = 0
-        ttk.Label(controls, text="Нижняя граница, мм").grid(row=row, column=0, sticky="w", padx=8, pady=(8, 0))
+        self._classic_label(controls, text="Нижняя граница, мм", anchor="w").grid(
+            row=row, column=0, sticky="ew", padx=8, pady=(8, 0)
+        )
         row += 1
         tk.Scale(
             controls,
@@ -882,14 +938,18 @@ class ToFTrackerApp(tk.Tk):
             variable=self.min_distance,
             bg=self.UI_BG,
             fg=self.UI_FG,
-            activebackground=self.UI_ACTIVE,
+            activebackground=self.UI_BUTTON_ACTIVE,
             troughcolor=self.UI_TROUGH,
-            highlightthickness=0,
+            highlightthickness=1,
+            highlightbackground=self.UI_BG,
+            highlightcolor=self.UI_BORDER,
             bd=0,
         ).grid(row=row, column=0, sticky="ew", padx=8)
 
         row += 1
-        ttk.Label(controls, text="Верхняя граница, мм").grid(row=row, column=0, sticky="w", padx=8, pady=(6, 0))
+        self._classic_label(controls, text="Верхняя граница, мм", anchor="w").grid(
+            row=row, column=0, sticky="ew", padx=8, pady=(6, 0)
+        )
         row += 1
         tk.Scale(
             controls,
@@ -901,15 +961,19 @@ class ToFTrackerApp(tk.Tk):
             variable=self.max_distance,
             bg=self.UI_BG,
             fg=self.UI_FG,
-            activebackground=self.UI_ACTIVE,
+            activebackground=self.UI_BUTTON_ACTIVE,
             troughcolor=self.UI_TROUGH,
-            highlightthickness=0,
+            highlightthickness=1,
+            highlightbackground=self.UI_BG,
+            highlightcolor=self.UI_BORDER,
             bd=0,
         ).grid(row=row, column=0, sticky="ew", padx=8)
 
         row += 1
-        sep = ttk.Separator(controls)
-        sep.grid(row=row, column=0, sticky="ew", padx=8, pady=8)
+        # Classic Tk separator: a one-pixel Frame, no ttk dependency.
+        tk.Frame(controls, bg=self.UI_BORDER, height=1, bd=0).grid(
+            row=row, column=0, sticky="ew", padx=8, pady=8
+        )
 
         row += 1
         row = self._spin_row(controls, row, "Прогноз через, кадров", self.prediction_frames, 1, 120, 1)
@@ -922,47 +986,66 @@ class ToFTrackerApp(tk.Tk):
         row = self._spin_row(controls, row, "Допуск по глубине, мм", self.assoc_depth, 30, 1200, 10)
         row = self._spin_row(controls, row, "Порог переключения, мм", self.switch_margin, 0, 1000, 10)
 
-        ttk.Button(controls, text="Применить", command=self.apply_settings).grid(
+        self._classic_button(controls, text="Применить", command=self.apply_settings).grid(
             row=row, column=0, sticky="ew", padx=8, pady=(10, 4)
         )
         row += 1
-        ttk.Button(controls, text="Сбросить трек", command=self.worker.reset_tracker).grid(
+        self._classic_button(controls, text="Сбросить трек", command=self.worker.reset_tracker).grid(
             row=row, column=0, sticky="ew", padx=8, pady=4
         )
         row += 1
-        ttk.Button(controls, text="Выход", command=self.on_close).grid(
+        self._classic_button(controls, text="Выход", command=self.on_close).grid(
             row=row, column=0, sticky="ew", padx=8, pady=(4, 10)
         )
 
-        telemetry = ttk.LabelFrame(root, text="Телеметрия")
+        telemetry = self._classic_labelframe(root, text="Телеметрия")
         telemetry.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        telemetry.columnconfigure(0, weight=1)
         self.telemetry_var = tk.StringVar(value="Запуск камеры...")
-        ttk.Label(
+        self._classic_label(
             telemetry,
             textvariable=self.telemetry_var,
             justify=tk.LEFT,
             anchor="w",
         ).grid(row=0, column=0, sticky="ew", padx=8, pady=8)
-        telemetry.columnconfigure(0, weight=1)
 
         self.status_var = tk.StringVar(value="Инициализация...")
-        ttk.Label(root, textvariable=self.status_var, anchor="w").grid(
+        self._classic_label(root, textvariable=self.status_var, anchor="w").grid(
             row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0)
         )
 
-    @staticmethod
-    def _spin_row(parent, row, label, variable, from_, to, increment) -> int:
-        line = ttk.Frame(parent)
+    def _spin_row(self, parent, row, label, variable, from_, to, increment) -> int:
+        line = tk.Frame(parent, bg=self.UI_BG)
         line.grid(row=row, column=0, sticky="ew", padx=8, pady=2)
         line.columnconfigure(0, weight=1)
-        ttk.Label(line, text=label).grid(row=0, column=0, sticky="w")
-        ttk.Spinbox(
+
+        tk.Label(
+            line,
+            text=label,
+            bg=self.UI_BG,
+            fg=self.UI_FG,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew")
+
+        tk.Spinbox(
             line,
             textvariable=variable,
             from_=from_,
             to=to,
             increment=increment,
             width=8,
+            bg=self.UI_FIELD_BG,
+            fg=self.UI_FG,
+            buttonbackground=self.UI_BUTTON_BG,
+            activebackground=self.UI_BUTTON_ACTIVE,
+            disabledbackground="#dddddd",
+            disabledforeground="#777777",
+            insertbackground=self.UI_FG,
+            relief=tk.SUNKEN,
+            bd=1,
+            highlightthickness=1,
+            highlightbackground=self.UI_BORDER,
+            highlightcolor=self.UI_BORDER,
         ).grid(row=0, column=1, sticky="e", padx=(8, 0))
         return row + 1
 
@@ -997,6 +1080,7 @@ class ToFTrackerApp(tk.Tk):
             self.settings.set(config)
             self.worker.reset_tracker()
             self.status_var.set("Параметры применены; трек переинициализирован.")
+            self._force_full_redraw()
         except Exception as exc:
             messagebox.showerror("Некорректные параметры", str(exc))
 
@@ -1047,7 +1131,6 @@ class ToFTrackerApp(tk.Tk):
         if self._closing:
             return
 
-        # Errors/info from the worker.
         while True:
             try:
                 kind, text = self.error_queue.get_nowait()
@@ -1085,11 +1168,14 @@ class ToFTrackerApp(tk.Tk):
         if self._closing:
             return
         self._closing = True
-        self.status_var.set("Остановка камеры...")
+        try:
+            self.status_var.set("Остановка камеры...")
+            self.update_idletasks()
+        except tk.TclError:
+            pass
         self.worker.stop()
         self.worker.join(timeout=1.5)
         self.destroy()
-
 
 def main() -> None:
     app = ToFTrackerApp()
