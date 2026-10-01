@@ -1,1572 +1,1404 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Arducam ToF + Arduino Uno camera gimbal, Python 3.10+.
+
+Start: python3 tof_gimbal_tracker.py
+Demo (no hardware): python3 tof_gimbal_tracker.py --demo
+Algorithm tests (no display/hardware): python3 tof_gimbal_tracker.py --self-test
+
+Dependencies: numpy, opencv-python, Pillow, pyFirmata2, pyserial, tkinter;
+real camera additionally needs ArducamDepthCamera and the correct Pi 5 driver.
+Arduino: StandardFirmata; X=D9, Y=D10, common GND, external servo supply.
+
+Coordinates: camera X=right, Y=down, Z=forward; metres and seconds internally.
+Base coordinates are approximate, relative to the stationary gimbal base.
+No GPS/IMU/encoder input: velocities are estimates, NOT aviation navigation data.
+Area is projected area normal to the optical axis, not total surface area.
+Frame time is HOST receipt time, not a hardware exposure timestamp.
+See the adjacent Russian README for installation, calibration and limitations.
+
+SDK reference: https://github.com/ArduCAM/Arducam_tof_camera
+Firmata reference: https://github.com/berndporr/pyFirmata2
 """
-Arducam ToF + Arduino Uno 2-axis gimbal tracker for Raspberry Pi 5.
-
-Hardware:
-  - Arducam ToF camera connected over CSI
-  - Arduino Uno running StandardFirmata
-  - X servo on D9
-  - Y servo on D10
-
-GUI:
-  - tkinter/ttk
-Image handling:
-  - OpenCV + Pillow
-Arduino link:
-  - pyFirmata2 + pyserial port discovery
-
-Design goals:
-  - Tkinter runs only in the main thread.
-  - Camera acquisition/tracking/servo control runs in a worker thread.
-  - Monotonic timestamps and sequence numbers are used for telemetry-like state.
-  - Tracking has confirmation, dropout tolerance, outlier gates, filtering,
-    command dead-band, rate limiting and servo angle saturation.
-"""
-
 from __future__ import annotations
 
+import argparse
+import csv
+import json
+import logging
 import math
+import queue
 import threading
 import time
-from dataclasses import dataclass, replace
-from typing import List, Optional, Tuple
+from collections import deque
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
+from pathlib import Path
 
 import cv2
 import numpy as np
-import tkinter as tk
-from tkinter import messagebox, ttk
-from PIL import Image, ImageTk
 
-import pyfirmata2
-from serial.tools import list_ports
-import ArducamDepthCamera as ac
+LOG = logging.getLogger("tof")
 
 
-# -----------------------------------------------------------------------------
-# Hardware constants
-# -----------------------------------------------------------------------------
-ARDUINO_DEFAULT_PORT = "/dev/ttyACM0"
-SERVO_X_PIN = 9
-SERVO_Y_PIN = 10
-SERVO_CENTER_X = 90.0
-SERVO_CENTER_Y = 90.0
-SENSOR_RANGE_MM = 4000  # the example camera API uses 2000 or 4000
-
-
-# -----------------------------------------------------------------------------
-# Helpers / data structures
-# -----------------------------------------------------------------------------
-def clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
-
-
-def finite_or(value: float, fallback: float = 0.0) -> float:
-    return float(value) if math.isfinite(float(value)) else fallback
-
-
-def serial_port_score(port) -> int:
-    """Score serial devices so the most likely Arduino is selected first."""
-    device = (getattr(port, "device", "") or "").lower()
-    description = (getattr(port, "description", "") or "").lower()
-    manufacturer = (getattr(port, "manufacturer", "") or "").lower()
-    product = (getattr(port, "product", "") or "").lower()
-    text = " ".join((device, description, manufacturer, product))
-    vid = getattr(port, "vid", None)
-
-    score = 0
-    # Official Arduino/Genuino USB vendor IDs.
-    if vid in (0x2341, 0x2A03):
-        score += 1000
-    if "arduino" in text or "genuino" in text:
-        score += 700
-
-    # On Linux/Raspberry Pi an Uno commonly enumerates as ttyACM*.
-    if device.startswith("/dev/ttyacm"):
-        score += 400
-    elif device.startswith("/dev/ttyusb"):
-        score += 250
-
-    # Common USB-to-serial bridges used by Arduino-compatible boards/clones.
-    for token in ("ch340", "ch341", "cp210", "ftdi", "usb serial", "usb-serial"):
-        if token in text:
-            score += 120
-            break
-
-    # De-prioritize ports that are very unlikely to be the gimbal controller.
-    for token in ("bluetooth", "rfcomm", "debug", "console"):
-        if token in text:
-            score -= 500
-
-    return score
-
-
-@dataclass
-class RuntimeConfig:
-    # Depth / segmentation
-    min_distance_mm: float = 300.0
-    max_distance_mm: float = 3500.0
-    confidence_threshold: float = 30.0
-    min_object_area_px: int = 70
-    morphology_kernel: int = 3
-
-    # Target stability / reacquisition
-    stable_frames: int = 5
-    lost_tolerance_frames: int = 5
-    reacquire_radius_px: float = 45.0
-    max_depth_jump_mm: float = 500.0
-
-    # Alpha-beta filter + prediction
-    filter_alpha: float = 0.65
-    filter_beta: float = 0.12
-    prediction_frames: int = 10
-    max_pixel_speed_px_s: float = 1800.0
-    max_depth_speed_m_s: float = 8.0
-
-    # Arduino / servos
-    arduino_port: str = ARDUINO_DEFAULT_PORT
-    servo_enabled: bool = True
-    servo_x_min: float = 20.0
-    servo_x_max: float = 160.0
-    servo_y_min: float = 45.0
-    servo_y_max: float = 135.0
-    servo_gain_x_deg_s: float = 55.0
-    servo_gain_y_deg_s: float = 55.0
-    servo_max_rate_deg_s: float = 70.0
-    servo_update_hz: float = 20.0
-    deadband_px: float = 6.0
-    invert_x: bool = False
+@dataclass(frozen=True)
+class Settings:
+    near: float = 0.25
+    far: float = 3.5
+    area_min: float = 0.002
+    area_max: float = 0.50
+    pixels_min: int = 35
+    frame_fraction: float = 0.65
+    depth_gap: float = 0.10
+    quality_min: float = 30.0
+    quality: str = "auto"
+    confirm: int = 5
+    lost_time: float = 0.5
+    association: float = 0.45
+    switch_margin: float = 0.20
+    switch_frames: int = 5
+    horizon_frames: int = 10
+    horizon_max: float = 0.8
+    latency: float = 0.05
+    measurement_noise: float = 0.04
+    acceleration_noise: float = 2.0
+    max_sigma: float = 0.40
+    fov_x: float = 60.0
+    fov_y: float = 45.0
+    radial_depth: bool = False
+    compensate: bool = True
+    x_min: float = 20.0
+    x_max: float = 160.0
+    y_min: float = 45.0
+    y_max: float = 135.0
+    invert_x: bool = True
     invert_y: bool = False
-    return_center_on_loss: bool = False
-    return_center_delay_s: float = 1.5
+    gain: float = 1.8
+    deadband: float = 1.5
+    max_speed: float = 40.0
+    max_acceleration: float = 100.0
+    manual_step: float = 3.0
+    stale_time: float = 0.35
+    sdk_range: int = 4000
+    camera_index: int = 0
+    connection: str = "CSI"
+    port: str = "AUTO"
 
-    # Control mode / manual gimbal control
-    control_mode: str = "AUTO"  # AUTO or MANUAL
-    manual_step_deg: float = 2.0
-    manual_rate_deg_s: float = 45.0
-
-
-@dataclass
-class Candidate:
-    cx: float
-    cy: float
-    depth_mm: float
-    area: int
-    bbox: Tuple[int, int, int, int]
-    mean_confidence: float
-
-
-@dataclass
-class TelemetrySnapshot:
-    seq: int = 0
-    monotonic_ns: int = 0
-    fps: float = 0.0
-    frame_age_ms: float = 0.0
-    state: str = "STOPPED"
-    target_valid: bool = False
-    stable_count: int = 0
-    lost_count: int = 0
-    x_px: float = 0.0
-    y_px: float = 0.0
-    z_m: float = 0.0
-    vx_px_s: float = 0.0
-    vy_px_s: float = 0.0
-    vz_m_s: float = 0.0
-    pred_x_px: float = 0.0
-    pred_y_px: float = 0.0
-    pred_z_m: float = 0.0
-    horizon_s: float = 0.0
-    servo_x_deg: float = SERVO_CENTER_X
-    servo_y_deg: float = SERVO_CENTER_Y
-    target_area_px: int = 0
-    confidence: float = 0.0
-    control_mode: str = "AUTO"
-    manual_x: int = 0
-    manual_y: int = 0
-    error: str = ""
-
-
-class SharedState:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._config = RuntimeConfig()
-        self._image_bgr: Optional[np.ndarray] = None
-        self._telemetry = TelemetrySnapshot()
-
-        # Manual input is kept separate from RuntimeConfig. Direction is a
-        # level state (-1/0/+1), while nudges and CENTER are edge-triggered.
-        # The worker thread is the only code that actually writes to Arduino.
-        self._manual_x = 0
-        self._manual_y = 0
-        self._manual_nudge_x_deg = 0.0
-        self._manual_nudge_y_deg = 0.0
-        self._manual_center_requested = False
-
-    def get_config(self) -> RuntimeConfig:
-        with self._lock:
-            return replace(self._config)
-
-    def set_config(self, cfg: RuntimeConfig) -> None:
-        with self._lock:
-            self._config = replace(cfg)
-
-    def set_frame(self, image_bgr: np.ndarray, telemetry: TelemetrySnapshot) -> None:
-        with self._lock:
-            self._image_bgr = image_bgr.copy()
-            self._telemetry = replace(telemetry)
-
-    def set_telemetry(self, telemetry: TelemetrySnapshot) -> None:
-        with self._lock:
-            self._telemetry = replace(telemetry)
-
-    def snapshot(self) -> Tuple[Optional[np.ndarray], TelemetrySnapshot]:
-        with self._lock:
-            image = None if self._image_bgr is None else self._image_bgr.copy()
-            return image, replace(self._telemetry)
-
-    def set_manual_direction(self, x: int, y: int) -> None:
-        with self._lock:
-            self._manual_x = int(clamp(x, -1, 1))
-            self._manual_y = int(clamp(y, -1, 1))
-
-    def queue_manual_nudge(self, dx_deg: float, dy_deg: float) -> None:
-        with self._lock:
-            self._manual_nudge_x_deg += float(dx_deg)
-            self._manual_nudge_y_deg += float(dy_deg)
-
-    def request_manual_center(self) -> None:
-        with self._lock:
-            self._manual_center_requested = True
-
-    def consume_manual_input(self) -> Tuple[int, int, float, float, bool]:
-        """Return current held direction and consume one-shot commands."""
-        with self._lock:
-            result = (
-                self._manual_x,
-                self._manual_y,
-                self._manual_nudge_x_deg,
-                self._manual_nudge_y_deg,
-                self._manual_center_requested,
-            )
-            self._manual_nudge_x_deg = 0.0
-            self._manual_nudge_y_deg = 0.0
-            self._manual_center_requested = False
-            return result
-
-    def clear_manual_input(self) -> None:
-        with self._lock:
-            self._manual_x = 0
-            self._manual_y = 0
-            self._manual_nudge_x_deg = 0.0
-            self._manual_nudge_y_deg = 0.0
-            self._manual_center_requested = False
+    def validate(self):
+        for key, default in asdict(Settings()).items():
+            value = getattr(self, key)
+            if type(default) is bool:
+                if type(value) is not bool:
+                    raise ValueError(f"{key}: требуется checkbox / boolean")
+            elif type(default) in (int, float):
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                    raise ValueError(f"{key}: требуется конечное число")
+                if type(default) is int and (type(value) is not int):
+                    raise ValueError(f"{key}: требуется целое число")
+            elif not isinstance(value, str):
+                raise ValueError(f"{key}: требуется строка")
+        if not 0 < self.near < self.far <= self.sdk_range / 1000:
+            raise ValueError("Дальность: 0 < минимум < максимум ≤ режим SDK / 1000")
+        if not 0 < self.area_min < self.area_max <= 100:
+            raise ValueError("Площадь: 0 < минимум < максимум ≤ 100 м²")
+        bounds = {
+            'pixels_min': (3, 1000000), 'frame_fraction': (.01, 1),
+            'depth_gap': (.005, 1), 'quality_min': (0, 65535),
+            'confirm': (1, 120), 'lost_time': (.05, 5), 'association': (.02, 3),
+            'switch_margin': (0, 3), 'switch_frames': (1, 120),
+            'horizon_frames': (0, 120), 'horizon_max': (0, 3), 'latency': (0, 1),
+            'measurement_noise': (.001, 1), 'acceleration_noise': (.01, 30),
+            'max_sigma': (.01, 3), 'fov_x': (5, 150), 'fov_y': (5, 150),
+            'gain': (.01, 10), 'deadband': (0, 20), 'max_speed': (1, 180),
+            'max_acceleration': (1, 1000), 'manual_step': (.1, 30),
+            'stale_time': (.05, 2), 'camera_index': (0, 32),
+        }
+        for key, (low, high) in bounds.items():
+            if not low <= getattr(self, key) <= high:
+                raise ValueError(f"{key}: допустимо от {low} до {high}")
+        for axis in ('x', 'y'):
+            if not 0 <= getattr(self, axis + '_min') < 90 < getattr(self, axis + '_max') <= 180:
+                raise ValueError(f"Ось {axis.upper()}: 0 ≤ min < 90 < max ≤ 180")
+        if self.sdk_range not in (2000, 4000):
+            raise ValueError("SDK RANGE: 2000 или 4000 мм")
+        if self.quality not in ('auto', 'confidence', 'amplitude', 'off'):
+            raise ValueError("Фильтр качества: auto / confidence / amplitude / off")
+        if self.connection not in ('CSI', 'USB') or not self.port.strip():
+            raise ValueError("Интерфейс: CSI/USB; порт: AUTO или имя устройства")
+        return self
 
 
-# -----------------------------------------------------------------------------
-# Alpha-beta filter (image X, image Y, depth Z)
-# -----------------------------------------------------------------------------
-class AlphaBetaFilter3D:
-    def __init__(self) -> None:
-        self.initialized = False
-        self.x = self.y = self.z = 0.0
-        self.vx = self.vy = self.vz = 0.0
-        self.last_t: Optional[float] = None
-
-    def reset(self) -> None:
-        self.__init__()
-
-    def initialize(self, x: float, y: float, z_m: float, now: float) -> None:
-        self.x, self.y, self.z = x, y, z_m
-        self.vx = self.vy = self.vz = 0.0
-        self.last_t = now
-        self.initialized = True
-
-    def update(
-        self,
-        mx: float,
-        my: float,
-        mz_m: float,
-        now: float,
-        alpha: float,
-        beta: float,
-        max_pixel_speed: float,
-        max_depth_speed: float,
-    ) -> Tuple[float, float, float, float, float, float, float]:
-        if not self.initialized or self.last_t is None:
-            self.initialize(mx, my, mz_m, now)
-            return self.x, self.y, self.z, self.vx, self.vy, self.vz, 0.0
-
-        raw_dt = now - self.last_t
-        self.last_t = now
-
-        # Very large dt means the telemetry stream was effectively interrupted.
-        # Keep position but discard stale velocity to prevent a prediction jump.
-        if raw_dt > 0.5 or raw_dt <= 0.0:
-            self.vx = self.vy = self.vz = 0.0
-            self.x, self.y, self.z = mx, my, mz_m
-            return self.x, self.y, self.z, self.vx, self.vy, self.vz, raw_dt
-
-        dt = clamp(raw_dt, 1.0 / 200.0, 0.20)
-
-        px = self.x + self.vx * dt
-        py = self.y + self.vy * dt
-        pz = self.z + self.vz * dt
-
-        rx = mx - px
-        ry = my - py
-        rz = mz_m - pz
-
-        self.x = px + alpha * rx
-        self.y = py + alpha * ry
-        self.z = pz + alpha * rz
-
-        self.vx += beta * rx / dt
-        self.vy += beta * ry / dt
-        self.vz += beta * rz / dt
-
-        self.vx = clamp(self.vx, -max_pixel_speed, max_pixel_speed)
-        self.vy = clamp(self.vy, -max_pixel_speed, max_pixel_speed)
-        self.vz = clamp(self.vz, -max_depth_speed, max_depth_speed)
-
-        return self.x, self.y, self.z, self.vx, self.vy, self.vz, raw_dt
-
-    def predict(self, horizon_s: float) -> Tuple[float, float, float]:
-        return (
-            self.x + self.vx * horizon_s,
-            self.y + self.vy * horizon_s,
-            max(0.0, self.z + self.vz * horizon_s),
-        )
+def intrinsics(shape, cfg):
+    h, w = shape
+    return (w / (2 * math.tan(math.radians(cfg.fov_x) / 2)),
+            h / (2 * math.tan(math.radians(cfg.fov_y) / 2)), (w - 1) / 2, (h - 1) / 2)
 
 
-# -----------------------------------------------------------------------------
-# Stable target selector
-# -----------------------------------------------------------------------------
-class StableTargetSelector:
-    """Acquire the nearest object only after it persists for stable_frames.
+def rotation(angles, cfg):
+    """Approximate camera-to-base rotation from commanded angles (no encoders)."""
+    if not cfg.compensate:
+        return np.eye(3)
+    yaw = math.radians((angles[0] - 90) * (-1 if cfg.invert_x else 1))
+    pitch = math.radians(-(angles[1] - 90) * (-1 if cfg.invert_y else 1))
+    cy, sy, cp, sp = math.cos(yaw), math.sin(yaw), math.cos(pitch), math.sin(pitch)
+    return np.array([[cy, sy * sp, sy * cp], [0, cp, -sp], [-sy, cy * sp, cy * cp]])
 
-    Once locked, keep the same connected component using image-space and depth
-    gates. This deliberately avoids target hopping caused by a one-frame closer
-    blob/noise return.
-    """
 
-    def __init__(self) -> None:
-        self.locked = False
-        self.stable_count = 0
-        self.lost_count = 0
-        self.tentative: Optional[Candidate] = None
-        self.last_target: Optional[Candidate] = None
-        self.last_seen_t: Optional[float] = None
-
-    def reset(self) -> None:
-        self.__init__()
-
-    @staticmethod
-    def _match(a: Candidate, b: Candidate, cfg: RuntimeConfig) -> bool:
-        dxy = math.hypot(a.cx - b.cx, a.cy - b.cy)
-        dz = abs(a.depth_mm - b.depth_mm)
-        return dxy <= cfg.reacquire_radius_px and dz <= cfg.max_depth_jump_mm
-
-    def update(
-        self,
-        candidates: List[Candidate],
-        cfg: RuntimeConfig,
-        now: float,
-    ) -> Optional[Candidate]:
-        if not candidates:
-            if self.locked:
-                self.lost_count += 1
-                if self.lost_count > cfg.lost_tolerance_frames:
-                    self.locked = False
-                    self.stable_count = 0
-                    self.last_target = None
-            else:
-                self.tentative = None
-                self.stable_count = 0
-            return None
-
-        # Locked mode: first try to continue the same physical blob.
-        if self.locked and self.last_target is not None:
-            matches = [c for c in candidates if self._match(c, self.last_target, cfg)]
-            if matches:
-                target = min(
-                    matches,
-                    key=lambda c: (
-                        math.hypot(c.cx - self.last_target.cx, c.cy - self.last_target.cy)
-                        + 0.03 * abs(c.depth_mm - self.last_target.depth_mm)
-                    ),
-                )
-                self.last_target = target
-                self.last_seen_t = now
-                self.lost_count = 0
-                return target
-
-            self.lost_count += 1
-            if self.lost_count <= cfg.lost_tolerance_frames:
-                return None
-
-            # Drop lock and begin a fresh nearest-target acquisition.
-            self.locked = False
-            self.last_target = None
-            self.stable_count = 0
-            self.tentative = None
-
-        # Acquisition mode: nearest object wins, but only after persistence.
-        nearest = min(candidates, key=lambda c: c.depth_mm)
-        if self.tentative is not None and self._match(nearest, self.tentative, cfg):
-            self.stable_count += 1
-        else:
-            self.tentative = nearest
-            self.stable_count = 1
-
-        self.tentative = nearest
-
-        if self.stable_count >= cfg.stable_frames:
-            self.locked = True
-            self.last_target = nearest
-            self.last_seen_t = now
-            self.lost_count = 0
-            return nearest
-
+def project(point, intr):
+    fx, fy, cx, cy = intr
+    if not np.all(np.isfinite(point)) or point[2] <= .05:
         return None
+    return np.array([point[0] * fx / point[2] + cx, point[1] * fy / point[2] + cy])
 
 
-# -----------------------------------------------------------------------------
-# Arduino / servo controller
-# -----------------------------------------------------------------------------
-class ServoController:
-    def __init__(self, port: str) -> None:
-        self.port = port
-        self.board = None
-        self.servo_x = None
-        self.servo_y = None
-        self.x_angle = SERVO_CENTER_X
-        self.y_angle = SERVO_CENTER_Y
-        self.last_cmd_t = time.monotonic()
+@dataclass
+class Detection:
+    point: np.ndarray
+    area: float
+    pixels: int
+    box: tuple
+    uv: tuple
+    distance: float
 
-    def connect(self) -> None:
-        self.board = pyfirmata2.Arduino(self.port)
-        self.servo_x = self.board.get_pin(f"d:{SERVO_X_PIN}:s")
-        self.servo_y = self.board.get_pin(f"d:{SERVO_Y_PIN}:s")
-        self.write_angles(SERVO_CENTER_X, SERVO_CENTER_Y, force=True)
-        time.sleep(0.4)
+
+def detect(depth, quality, cfg):
+    """Depth-continuous components; a sloping surface is not split into depth bins.
+
+    floodFill uses a floating local depth tolerance. Connectivity cannot separate
+    touching objects of similar depth; the GUI exposes this tolerance explicitly.
+    Returns foreground mask plus detections. A processing cap limits noise storms.
+    """
+    h, w = depth.shape
+    fx, fy, cx, cy = intrinsics(depth.shape, cfg)
+    valid = np.isfinite(depth) & (depth >= cfg.near) & (depth <= cfg.far)
+    if quality is not None and cfg.quality != 'off':
+        valid &= np.isfinite(quality) & (quality >= cfg.quality_min)
+    valid = cv2.morphologyEx(valid.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)).astype(bool)
+    clean = np.where(valid, depth, 0).astype(np.float32)
+    smooth = cv2.medianBlur(clean, 3)
+    mask = np.ones((h + 2, w + 2), np.uint8)
+    mask[1:-1, 1:-1] = (~valid).astype(np.uint8)
+    inside = mask[1:-1, 1:-1]
+    indices = np.flatnonzero(valid)
+    # Near-first processing makes the cap deterministic and relevant to selection.
+    indices = indices[np.argsort(clean.ravel()[indices])]
+    detections = []
+    components = 0
+    for index in indices:
+        v, u = divmod(int(index), w)
+        if inside[v, u]:
+            continue
+        count, _, _, rect = cv2.floodFill(smooth, mask, (u, v), 0,
+            loDiff=cfg.depth_gap, upDiff=cfg.depth_gap,
+            flags=4 | cv2.FLOODFILL_MASK_ONLY | (2 << 8))
+        components += 1
+        x, y, rw, rh = rect
+        sub = inside[y:y + rh, x:x + rw]
+        part = sub == 2
+        sub[part] = 1
+        if cfg.pixels_min <= count <= h * w * cfg.frame_fraction:
+            yy, xx = np.nonzero(part)
+            xx, yy = xx + x, yy + y
+            z = depth[yy, xx].astype(np.float64)
+            xn, yn = (xx - cx) / fx, (yy - cy) / fy
+            if cfg.radial_depth:
+                z = z / np.sqrt(1 + xn * xn + yn * yn)
+            area = float(np.sum(z * z) / (fx * fy))
+            if cfg.area_min <= area <= cfg.area_max:
+                point = np.array([np.median(xn * z), np.median(yn * z), np.median(z)])
+                uv = project(point, (fx, fy, cx, cy))
+                detections.append(Detection(point, area, count, rect, tuple(uv), float(np.linalg.norm(point))))
+        if components >= 512:
+            break
+    return detections, valid, components >= 512
+
+
+class Filter:
+    """6-state constant-velocity Kalman filter in metres and seconds."""
+    def __init__(self, point, cfg):
+        self.x = np.r_[point, np.zeros(3)]
+        self.P = np.diag([cfg.measurement_noise ** 2] * 3 + [1.] * 3)
+
+    def predict(self, dt, cfg):
+        F = np.eye(6)
+        F[:3, 3:] = np.eye(3) * dt
+        G = np.vstack((np.eye(3) * dt * dt / 2, np.eye(3) * dt))
+        self.x = F @ self.x
+        self.P = F @ self.P @ F.T + G @ G.T * cfg.acceleration_noise ** 2
+
+    def correct(self, point, cfg):
+        R = np.eye(3) * cfg.measurement_noise ** 2
+        K = np.linalg.solve(self.P[:3, :3] + R, self.P[:3, :]).T
+        self.x += K @ (point - self.x[:3])
+        A = np.eye(6)
+        A[:, :3] -= K
+        self.P = A @ self.P @ A.T + K @ R @ K.T  # Joseph form
+        self.P = (self.P + self.P.T) / 2
+
+    def future(self, horizon, cfg):
+        H = np.hstack((np.eye(3), np.eye(3) * horizon))
+        covariance = H @ self.P @ H.T + np.eye(3) * cfg.acceleration_noise ** 2 * horizon ** 4 / 4
+        return H @ self.x, math.sqrt(max(0., float(np.linalg.eigvalsh(covariance)[-1])))
+
+
+@dataclass
+class Track:
+    id: int
+    kf: Filter
+    detection: Detection
+    last_seen: float
+    hits: int = 1
+    streak: int = 1
+    visible: bool = True
+    confirmed: bool = False
+
+
+class Tracker:
+    def __init__(self):
+        self.tracks = []
+        self.next_id = 1
+        self.selected = None
+        self.challenger = None
+        self.challenger_count = 0
+        self.last_time = None
+        self.period = 1 / 30
+
+    def update(self, detections, timestamp, R, cfg):
+        dt = 0 if self.last_time is None else timestamp - self.last_time
+        if dt < 0 or dt > cfg.lost_time:
+            self.tracks.clear()
+            self.selected = None
+        if 0 < dt <= cfg.lost_time:
+            self.period = .9 * self.period + .1 * dt
+        self.last_time = timestamp
+        self.tracks = [t for t in self.tracks if timestamp - t.last_seen <= cfg.lost_time]
+        for t in self.tracks:
+            t.kf.predict(max(0, dt), cfg)
+            t.visible = False
+        points = [R @ d.point for d in detections]
+        pairs = []
+        for i, t in enumerate(self.tracks):
+            for j, p in enumerate(points):
+                residual = p - t.kf.x[:3]
+                distance = float(np.linalg.norm(residual))
+                ratio = detections[j].area / max(t.detection.area, 1e-9)
+                S = t.kf.P[:3, :3] + np.eye(3) * cfg.measurement_noise ** 2
+                mahal = float(residual @ np.linalg.solve(S, residual))
+                if distance <= cfg.association and .25 <= ratio <= 4 and mahal <= 16.27:
+                    pairs.append((mahal + abs(math.log(ratio)), i, j))
+        used_t, used_d = set(), set()
+        for _, i, j in sorted(pairs):
+            if i in used_t or j in used_d:
+                continue
+            used_t.add(i)
+            used_d.add(j)
+            t = self.tracks[i]
+            t.kf.correct(points[j], cfg)
+            t.detection, t.last_seen, t.visible = detections[j], timestamp, True
+            t.hits += 1
+            t.streak += 1
+            t.confirmed |= t.streak >= cfg.confirm
+        for i, t in enumerate(self.tracks):
+            if i not in used_t:
+                t.streak = 0
+        for j, d in enumerate(detections):
+            if j not in used_d:
+                self.tracks.append(Track(self.next_id, Filter(points[j], cfg), d, timestamp,
+                                         confirmed=cfg.confirm == 1))
+                self.next_id += 1
+        eligible = [t for t in self.tracks if t.confirmed and t.visible]
+        current = next((t for t in self.tracks if t.id == self.selected), None)
+        nearest = min(eligible, key=lambda t: t.detection.distance, default=None)
+        # Keep identity during short occlusions; NEVER drive on unobserved tracks.
+        if current is None:
+            current = nearest
+            self.selected = current.id if current else None
+            self.challenger, self.challenger_count = None, 0
+        elif (nearest and current.visible and nearest.id != current.id and
+              nearest.detection.distance + cfg.switch_margin < current.detection.distance):
+            self.challenger_count = self.challenger_count + 1 if self.challenger == nearest.id else 1
+            self.challenger = nearest.id
+            if self.challenger_count >= cfg.switch_frames:
+                current, self.selected = nearest, nearest.id
+                self.challenger, self.challenger_count = None, 0
+        else:
+            self.challenger, self.challenger_count = None, 0
+        return current
+
+
+class Gimbal:
+    def __init__(self, demo=False):
+        self.demo, self.board = demo, None
+        self.angles = np.array([90., 90.])
+        self.velocity = np.zeros(2)
+        self.sent = np.array([np.nan, np.nan])
+        self.last_write = 0.
+        self.port = 'DEMO' if demo else 'не подключено'
 
     @property
-    def connected(self) -> bool:
-        return self.board is not None and self.servo_x is not None and self.servo_y is not None
+    def connected(self):
+        return self.demo or self.board is not None
 
-    def write_angles(self, x_deg: float, y_deg: float, force: bool = False) -> None:
-        if not self.connected:
+    def connect(self, port, cancelled=lambda: False):
+        if cancelled():
+            raise RuntimeError('Подключение отменено')
+        if self.demo:
+            self.angles[:] = 90
+            self.velocity[:] = 0
             return
-        if force or abs(x_deg - self.x_angle) >= 0.05:
-            self.servo_x.write(float(x_deg))
-            self.x_angle = float(x_deg)
-        if force or abs(y_deg - self.y_angle) >= 0.05:
-            self.servo_y.write(float(y_deg))
-            self.y_angle = float(y_deg)
-
-    def center(self, cfg: RuntimeConfig) -> None:
-        x = clamp(SERVO_CENTER_X, cfg.servo_x_min, cfg.servo_x_max)
-        y = clamp(SERVO_CENTER_Y, cfg.servo_y_min, cfg.servo_y_max)
-        self.write_angles(x, y, force=True)
-
-    def update_tracking(
-        self,
-        target_x: float,
-        target_y: float,
-        width: int,
-        height: int,
-        cfg: RuntimeConfig,
-        now: float,
-    ) -> None:
-        if not self.connected or not cfg.servo_enabled:
-            return
-
-        min_period = 1.0 / max(1.0, cfg.servo_update_hz)
-        dt = now - self.last_cmd_t
-        if dt < min_period:
-            return
-        self.last_cmd_t = now
-        dt = clamp(dt, min_period, 0.20)
-
-        cx = width * 0.5
-        cy = height * 0.5
-        ex_px = target_x - cx
-        ey_px = target_y - cy
-
-        if abs(ex_px) <= cfg.deadband_px:
-            ex_px = 0.0
-        if abs(ey_px) <= cfg.deadband_px:
-            ey_px = 0.0
-
-        ex_norm = clamp(ex_px / max(1.0, cx), -1.0, 1.0)
-        ey_norm = clamp(ey_px / max(1.0, cy), -1.0, 1.0)
-
-        if cfg.invert_x:
-            ex_norm *= -1.0
-        if cfg.invert_y:
-            ey_norm *= -1.0
-
-        x_rate = clamp(
-            cfg.servo_gain_x_deg_s * ex_norm,
-            -cfg.servo_max_rate_deg_s,
-            cfg.servo_max_rate_deg_s,
-        )
-        y_rate = clamp(
-            cfg.servo_gain_y_deg_s * ey_norm,
-            -cfg.servo_max_rate_deg_s,
-            cfg.servo_max_rate_deg_s,
-        )
-
-        new_x = clamp(self.x_angle + x_rate * dt, cfg.servo_x_min, cfg.servo_x_max)
-        new_y = clamp(self.y_angle + y_rate * dt, cfg.servo_y_min, cfg.servo_y_max)
-        self.write_angles(new_x, new_y)
-
-    def update_manual(
-        self,
-        held_x: int,
-        held_y: int,
-        nudge_x_deg: float,
-        nudge_y_deg: float,
-        center_requested: bool,
-        cfg: RuntimeConfig,
-        now: float,
-    ) -> None:
-        """Apply MANUAL commands while preserving limits and slew behavior.
-
-        held_x / held_y are semantic directions:
-          X: -1 = left,  +1 = right
-          Y: -1 = up,    +1 = down
-
-        Nudge values use the same semantic sign and guarantee that a very short
-        click still changes the position even if it falls between worker ticks.
-        """
-        if not self.connected or not cfg.servo_enabled:
-            return
-
-        if center_requested:
-            self.center(cfg)
-            self.last_cmd_t = now
-            return
-
-        # Physical installation may reverse one or both servo directions.
-        x_sign = -1.0 if cfg.invert_x else 1.0
-        y_sign = -1.0 if cfg.invert_y else 1.0
-
-        # Edge-triggered nudge: useful for precise single clicks / key taps.
-        if abs(nudge_x_deg) > 1e-9 or abs(nudge_y_deg) > 1e-9:
-            new_x = clamp(
-                self.x_angle + x_sign * nudge_x_deg,
-                cfg.servo_x_min,
-                cfg.servo_x_max,
-            )
-            new_y = clamp(
-                self.y_angle + y_sign * nudge_y_deg,
-                cfg.servo_y_min,
-                cfg.servo_y_max,
-            )
-            self.write_angles(new_x, new_y)
-            self.last_cmd_t = now
-            return
-
-        # Level-triggered command: smooth movement while a key/button is held.
-        if held_x == 0 and held_y == 0:
-            return
-
-        min_period = 1.0 / max(1.0, cfg.servo_update_hz)
-        dt = now - self.last_cmd_t
-        if dt < min_period:
-            return
-        self.last_cmd_t = now
-        dt = clamp(dt, min_period, 0.20)
-
-        max_rate = min(cfg.manual_rate_deg_s, cfg.servo_max_rate_deg_s)
-        x_rate = x_sign * float(held_x) * max_rate
-        y_rate = y_sign * float(held_y) * max_rate
-
-        new_x = clamp(self.x_angle + x_rate * dt, cfg.servo_x_min, cfg.servo_x_max)
-        new_y = clamp(self.y_angle + y_rate * dt, cfg.servo_y_min, cfg.servo_y_max)
-        self.write_angles(new_x, new_y)
-
-    def close(self) -> None:
-        if self.board is not None:
-            try:
-                self.board.exit()
-            except Exception:
-                pass
-        self.board = None
-        self.servo_x = None
-        self.servo_y = None
-
-
-# -----------------------------------------------------------------------------
-# Vision / tracking utilities
-# -----------------------------------------------------------------------------
-def build_candidates(
-    depth_mm: np.ndarray,
-    confidence: Optional[np.ndarray],
-    cfg: RuntimeConfig,
-) -> Tuple[List[Candidate], np.ndarray]:
-    depth = np.asarray(depth_mm, dtype=np.float32)
-    valid = np.isfinite(depth)
-    valid &= depth >= cfg.min_distance_mm
-    valid &= depth <= cfg.max_distance_mm
-
-    conf_arr: Optional[np.ndarray]
-    if confidence is not None:
-        conf_arr = np.asarray(confidence, dtype=np.float32)
-        if conf_arr.shape == depth.shape:
-            valid &= np.isfinite(conf_arr)
-            valid &= conf_arr >= cfg.confidence_threshold
-        else:
-            conf_arr = None
-    else:
-        conf_arr = None
-
-    mask = (valid.astype(np.uint8) * 255)
-
-    k = int(cfg.morphology_kernel)
-    if k >= 3:
-        if k % 2 == 0:
-            k += 1
-        kernel = np.ones((k, k), dtype=np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    n, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    candidates: List[Candidate] = []
-
-    for label_id in range(1, n):
-        area = int(stats[label_id, cv2.CC_STAT_AREA])
-        if area < cfg.min_object_area_px:
-            continue
-
-        x = int(stats[label_id, cv2.CC_STAT_LEFT])
-        y = int(stats[label_id, cv2.CC_STAT_TOP])
-        w = int(stats[label_id, cv2.CC_STAT_WIDTH])
-        h = int(stats[label_id, cv2.CC_STAT_HEIGHT])
-        region = labels == label_id
-        values = depth[region]
-        values = values[np.isfinite(values)]
-        if values.size == 0:
-            continue
-
-        depth_med = float(np.median(values))
-        cx, cy = map(float, centroids[label_id])
-
-        mean_conf = 0.0
-        if conf_arr is not None:
-            cvals = conf_arr[region]
-            cvals = cvals[np.isfinite(cvals)]
-            if cvals.size:
-                mean_conf = float(np.mean(cvals))
-
-        candidates.append(
-            Candidate(
-                cx=cx,
-                cy=cy,
-                depth_mm=depth_med,
-                area=area,
-                bbox=(x, y, w, h),
-                mean_confidence=mean_conf,
-            )
-        )
-
-    return candidates, mask
-
-
-def render_depth(
-    depth_mm: np.ndarray,
-    confidence: Optional[np.ndarray],
-    cfg: RuntimeConfig,
-    candidates: List[Candidate],
-    target: Optional[Candidate],
-    filt: AlphaBetaFilter3D,
-    pred: Optional[Tuple[float, float, float]],
-    telemetry: TelemetrySnapshot,
-) -> np.ndarray:
-    depth = np.asarray(depth_mm, dtype=np.float32)
-    finite = np.isfinite(depth)
-    valid = finite & (depth >= cfg.min_distance_mm) & (depth <= cfg.max_distance_mm)
-
-    if confidence is not None:
-        conf_arr = np.asarray(confidence, dtype=np.float32)
-        if conf_arr.shape == depth.shape:
-            valid &= np.isfinite(conf_arr) & (conf_arr >= cfg.confidence_threshold)
-
-    span = max(1.0, cfg.max_distance_mm - cfg.min_distance_mm)
-    normalized = (depth - cfg.min_distance_mm) / span
-    normalized = np.nan_to_num(normalized, nan=0.0, posinf=1.0, neginf=0.0)
-    normalized = np.clip(normalized, 0.0, 1.0)
-    # Nearer = warmer/brighter side of the selected colormap.
-    gray = ((1.0 - normalized) * 255.0).astype(np.uint8)
-    gray[~valid] = 0
-    image = cv2.applyColorMap(gray, cv2.COLORMAP_TURBO)
-    image[~valid] = (0, 0, 0)
-
-    h, w = image.shape[:2]
-    center = (w // 2, h // 2)
-    cv2.drawMarker(image, center, (255, 255, 255), cv2.MARKER_CROSS, 12, 1)
-
-    for c in candidates:
-        x, y, bw, bh = c.bbox
-        cv2.rectangle(image, (x, y), (x + bw, y + bh), (120, 120, 120), 1)
-
-    if target is not None and filt.initialized:
-        x, y, bw, bh = target.bbox
-        cv2.rectangle(image, (x, y), (x + bw, y + bh), (255, 255, 255), 2)
-        current = (int(round(filt.x)), int(round(filt.y)))
-        cv2.circle(image, current, 4, (255, 255, 255), -1)
-
-        if pred is not None:
-            px = int(round(clamp(pred[0], 0, w - 1)))
-            py = int(round(clamp(pred[1], 0, h - 1)))
-            cv2.arrowedLine(image, current, (px, py), (255, 255, 255), 1, tipLength=0.20)
-            cv2.circle(image, (px, py), 5, (0, 255, 255), 1)
-
-    # Minimal in-frame telemetry. Detailed values are also shown in the GUI.
-    approach = "APPROACH" if telemetry.vz_m_s < -0.03 else ("RECEDE" if telemetry.vz_m_s > 0.03 else "STEADY")
-    lines = [
-        f"{telemetry.state}  {telemetry.control_mode}  FPS {telemetry.fps:.1f}",
-        f"Z {telemetry.z_m:.2f} m  Vz {telemetry.vz_m_s:+.2f} m/s  {approach}",
-        f"Servo X/Y {telemetry.servo_x_deg:.1f}/{telemetry.servo_y_deg:.1f}",
-    ]
-    y0 = 14
-    for i, text in enumerate(lines):
-        cv2.putText(image, text, (5, y0 + i * 14), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (255, 255, 255), 1, cv2.LINE_AA)
-
-    return image
-
-
-# -----------------------------------------------------------------------------
-# Worker thread
-# -----------------------------------------------------------------------------
-class TrackerWorker(threading.Thread):
-    def __init__(self, shared: SharedState) -> None:
-        super().__init__(daemon=True)
-        self.shared = shared
-        self.stop_event = threading.Event()
-        self.camera = None
-        self.servo: Optional[ServoController] = None
-        self.selector = StableTargetSelector()
-        self.filter = AlphaBetaFilter3D()
-        self.seq = 0
-        self.fps_ema = 0.0
-        self.prev_frame_t: Optional[float] = None
-        self.last_valid_target_t: Optional[float] = None
-
-    def stop(self) -> None:
-        self.stop_event.set()
-
-    def _set_error(self, message: str) -> None:
-        _, old = self.shared.snapshot()
-        old.state = "ERROR"
-        old.error = message
-        old.monotonic_ns = time.monotonic_ns()
-        self.shared.set_telemetry(old)
-
-    def _open_camera(self) -> None:
-        self.camera = ac.ArducamCamera()
-        ret = self.camera.open(ac.Connection.CSI, 0)
-        if ret != 0:
-            raise RuntimeError(f"Arducam open(CSI, 0) failed, code={ret}")
-
-        ret = self.camera.start(ac.FrameType.DEPTH)
-        if ret != 0:
-            try:
-                self.camera.close()
-            finally:
-                self.camera = None
-            raise RuntimeError(f"Arducam start(DEPTH) failed, code={ret}")
-
-        self.camera.setControl(ac.Control.RANGE, SENSOR_RANGE_MM)
-
-    def _close_camera(self) -> None:
-        if self.camera is not None:
-            try:
-                self.camera.stop()
-            except Exception:
-                pass
-            try:
-                self.camera.close()
-            except Exception:
-                pass
-            self.camera = None
-
-    def _service_manual_servo(self, cfg: RuntimeConfig, now: float) -> Tuple[int, int]:
-        if cfg.control_mode != "MANUAL":
-            self.shared.clear_manual_input()
-            return 0, 0
-
-        held_x, held_y, nudge_x, nudge_y, center = self.shared.consume_manual_input()
-        if self.servo is not None:
-            self.servo.update_manual(
-                held_x, held_y, nudge_x, nudge_y, center, cfg, now
-            )
-        return held_x, held_y
-
-    def run(self) -> None:
-        telemetry = TelemetrySnapshot(state="STARTING", monotonic_ns=time.monotonic_ns())
-        self.shared.set_telemetry(telemetry)
-
+        import pyfirmata2
+        from serial.tools import list_ports
+        if port.upper() == 'AUTO':
+            candidates = [p for p in list_ports.comports()
+                          if p.vid in (0x2341, 0x2A03, 0x1A86, 0x0403, 0x10C4)
+                          or 'arduino' in (p.description or '').lower()]
+            if len(candidates) != 1:
+                ports = ', '.join(p.device for p in candidates) or 'нет подходящих USB-портов'
+                raise RuntimeError(f"AUTO: {ports}. Укажите порт вручную во вкладке «Связь».")
+            port = candidates[0].device
+        self.close()
+        board = None
         try:
-            cfg = self.shared.get_config()
-            telemetry.control_mode = cfg.control_mode
-
-            # Arduino failure is non-fatal: vision can still be debugged.
-            try:
-                self.servo = ServoController(cfg.arduino_port)
-                self.servo.connect()
-            except Exception as exc:
-                self.servo = None
-                telemetry.error = f"Arduino unavailable: {exc}"
-
-            self._open_camera()
-            telemetry.state = "SEARCH"
-            self.shared.set_telemetry(telemetry)
-
-            while not self.stop_event.is_set():
-                cfg = self.shared.get_config()
-
-                # Manual control is serviced independently of successful camera
-                # frames. A shorter request timeout keeps MANUAL responsive even
-                # if the ToF stream temporarily stalls.
-                input_t = time.monotonic()
-                manual_x, manual_y = self._service_manual_servo(cfg, input_t)
-
-                frame = self.camera.requestFrame(100)
-                now = time.monotonic()
-                stamp_ns = time.monotonic_ns()
-
-                if frame is None:
-                    telemetry.state = "NO_FRAME"
-                    telemetry.control_mode = cfg.control_mode
-                    telemetry.manual_x = manual_x
-                    telemetry.manual_y = manual_y
-                    telemetry.monotonic_ns = stamp_ns
-                    if self.servo is not None:
-                        telemetry.servo_x_deg = self.servo.x_angle
-                        telemetry.servo_y_deg = self.servo.y_angle
-                    self.shared.set_telemetry(telemetry)
-                    continue
-
-                try:
-                    if not isinstance(frame, ac.DepthData):
-                        continue
-
-                    depth_buf = np.array(frame.depth_data, dtype=np.float32, copy=True)
-                    confidence_src = getattr(frame, "confidence_data", None)
-                    confidence_buf = None
-                    if confidence_src is not None:
-                        confidence_buf = np.array(confidence_src, dtype=np.float32, copy=True)
-                finally:
-                    # Release SDK-owned frame memory as early as possible.
-                    self.camera.releaseFrame(frame)
-
-                self.seq += 1
-                if self.prev_frame_t is not None:
-                    dt_frame = now - self.prev_frame_t
-                    if dt_frame > 0:
-                        inst_fps = 1.0 / dt_frame
-                        self.fps_ema = inst_fps if self.fps_ema <= 0 else (0.90 * self.fps_ema + 0.10 * inst_fps)
-                self.prev_frame_t = now
-
-                candidates, _ = build_candidates(depth_buf, confidence_buf, cfg)
-                target = self.selector.update(candidates, cfg, now)
-
-                telemetry = TelemetrySnapshot(
-                    seq=self.seq,
-                    monotonic_ns=stamp_ns,
-                    fps=self.fps_ema,
-                    frame_age_ms=0.0,
-                    state="ACQUIRE" if not self.selector.locked else "TRACK",
-                    target_valid=False,
-                    stable_count=self.selector.stable_count,
-                    lost_count=self.selector.lost_count,
-                    servo_x_deg=self.servo.x_angle if self.servo else SERVO_CENTER_X,
-                    servo_y_deg=self.servo.y_angle if self.servo else SERVO_CENTER_Y,
-                    control_mode=cfg.control_mode,
-                    manual_x=manual_x,
-                    manual_y=manual_y,
-                    error=telemetry.error,
-                )
-
-                prediction: Optional[Tuple[float, float, float]] = None
-
-                if target is not None:
-                    self.last_valid_target_t = now
-                    z_m = target.depth_mm / 1000.0
-                    x, y, z, vx, vy, vz, _ = self.filter.update(
-                        target.cx,
-                        target.cy,
-                        z_m,
-                        now,
-                        cfg.filter_alpha,
-                        cfg.filter_beta,
-                        cfg.max_pixel_speed_px_s,
-                        cfg.max_depth_speed_m_s,
-                    )
-
-                    # "N frames into the future" is converted to time using EMA FPS.
-                    effective_fps = self.fps_ema if self.fps_ema >= 1.0 else 30.0
-                    horizon_s = cfg.prediction_frames / effective_fps
-                    prediction = self.filter.predict(horizon_s)
-
-                    telemetry.target_valid = True
-                    telemetry.x_px = x
-                    telemetry.y_px = y
-                    telemetry.z_m = z
-                    telemetry.vx_px_s = vx
-                    telemetry.vy_px_s = vy
-                    telemetry.vz_m_s = vz
-                    telemetry.pred_x_px = prediction[0]
-                    telemetry.pred_y_px = prediction[1]
-                    telemetry.pred_z_m = prediction[2]
-                    telemetry.horizon_s = horizon_s
-                    telemetry.target_area_px = target.area
-                    telemetry.confidence = target.mean_confidence
-
-                    if self.servo is not None and cfg.control_mode == "AUTO":
-                        # Point at predicted screen position to compensate for lag.
-                        self.servo.update_tracking(
-                            prediction[0],
-                            prediction[1],
-                            depth_buf.shape[1],
-                            depth_buf.shape[0],
-                            cfg,
-                            now,
-                        )
-                        telemetry.servo_x_deg = self.servo.x_angle
-                        telemetry.servo_y_deg = self.servo.y_angle
-                    elif self.servo is not None:
-                        # In MANUAL the vision pipeline continues to track and
-                        # predict, but it is read-only with respect to the gimbal.
-                        telemetry.servo_x_deg = self.servo.x_angle
-                        telemetry.servo_y_deg = self.servo.y_angle
+            board = pyfirmata2.Arduino(port, timeout=.1)
+            board.sp.write_timeout = .2
+            # Read protocol version before attaching servos. Avoid arbitrary USB devices.
+            deadline = time.monotonic() + 2
+            board.sp.write(bytes([0xF9]))
+            while not board.get_firmata_version() and time.monotonic() < deadline:
+                if board.bytes_available():
+                    board.iterate()
                 else:
-                    # Avoid retaining stale velocity after lock is truly lost.
-                    if not self.selector.locked:
-                        self.filter.reset()
-                        telemetry.state = "SEARCH" if self.selector.stable_count == 0 else "ACQUIRE"
-
-                    if (
-                        cfg.control_mode == "AUTO"
-                        and cfg.return_center_on_loss
-                        and self.servo is not None
-                        and self.last_valid_target_t is not None
-                        and now - self.last_valid_target_t >= cfg.return_center_delay_s
-                    ):
-                        self.servo.center(cfg)
-                        telemetry.servo_x_deg = self.servo.x_angle
-                        telemetry.servo_y_deg = self.servo.y_angle
-
-                image = render_depth(
-                    depth_buf,
-                    confidence_buf,
-                    cfg,
-                    candidates,
-                    target,
-                    self.filter,
-                    prediction,
-                    telemetry,
-                )
-                self.shared.set_frame(image, telemetry)
-
-        except Exception as exc:
-            self._set_error(str(exc))
-        finally:
-            self._close_camera()
-            if self.servo is not None:
-                try:
-                    # Defined neutral/park position for an orderly shutdown.
-                    self.servo.center(self.shared.get_config())
-                    time.sleep(0.15)
-                except Exception:
-                    pass
-                self.servo.close()
-            _, final_t = self.shared.snapshot()
-            if final_t.state != "ERROR":
-                final_t.state = "STOPPED"
-                final_t.monotonic_ns = time.monotonic_ns()
-                self.shared.set_telemetry(final_t)
-
-
-# -----------------------------------------------------------------------------
-# Tkinter GUI
-# -----------------------------------------------------------------------------
-class TrackerApp:
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.root.title("Arducam ToF + Arduino 2-axis tracker")
-        self.root.minsize(1120, 720)
-
-        style = ttk.Style(self.root)
-        # 'clam' is generally more predictable on Raspberry Pi/X11 than some
-        # platform themes and avoids several redraw/visibility glitches.
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-
-        self.shared = SharedState()
-        self.worker: Optional[TrackerWorker] = None
-        self.tk_image: Optional[ImageTk.PhotoImage] = None
-
-        self.vars = {}
-        self.status_var = tk.StringVar(value="STOPPED")
-        self.telemetry_var = tk.StringVar(value="Система не запущена")
-        self.error_var = tk.StringVar(value="")
-        self.control_mode_var = tk.StringVar(value="AUTO")
-        self.arduino_port_info_var = tk.StringVar(value="Порты ещё не просканированы")
-        self.arduino_port_combo: Optional[ttk.Combobox] = None
-        self._serial_ports_by_device = {}
-        self.manual_buttons: List[ttk.Button] = []
-        self._pressed_manual_keys = set()
-
-        self._build_ui()
-        self._load_config_to_ui(self.shared.get_config())
-        # Populate the selector after widgets and StringVars exist. Prefer a
-        # detected Arduino over the hard-coded fallback /dev/ttyACM0.
-        self.refresh_arduino_ports(auto_select=True)
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self._bind_manual_keyboard()
-        self.root.after(50, self._ui_tick)
-
-    def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=8)
-        outer.pack(fill="both", expand=True)
-        outer.columnconfigure(0, weight=4)
-        outer.columnconfigure(1, weight=2)
-        outer.rowconfigure(0, weight=1)
-
-        # Video panel ----------------------------------------------------------
-        video_box = ttk.LabelFrame(outer, text="ToF / tracking", padding=6)
-        video_box.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        video_box.rowconfigure(0, weight=1)
-        video_box.columnconfigure(0, weight=1)
-
-        self.video_label = ttk.Label(video_box, anchor="center")
-        self.video_label.grid(row=0, column=0, sticky="nsew")
-
-        ttk.Label(video_box, textvariable=self.telemetry_var, justify="left").grid(
-            row=1, column=0, sticky="ew", pady=(6, 0)
-        )
-
-        # Control panel --------------------------------------------------------
-        right = ttk.Frame(outer)
-        right.grid(row=0, column=1, sticky="nsew")
-        right.columnconfigure(0, weight=1)
-        right.rowconfigure(1, weight=1)
-
-        action = ttk.LabelFrame(right, text="Управление", padding=8)
-        action.grid(row=0, column=0, sticky="ew")
-        action.columnconfigure((0, 1, 2), weight=1)
-
-        self.start_button = ttk.Button(action, text="Старт", command=self.start_system)
-        self.start_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.stop_button = ttk.Button(action, text="Стоп", command=self.stop_system)
-        self.stop_button.grid(row=0, column=1, sticky="ew", padx=4)
-        ttk.Button(action, text="Применить", command=self.apply_settings).grid(
-            row=0, column=2, sticky="ew", padx=(4, 0)
-        )
-        ttk.Label(action, text="Состояние:").grid(row=1, column=0, sticky="w", pady=(7, 0))
-        ttk.Label(action, textvariable=self.status_var).grid(row=1, column=1, columnspan=2, sticky="w", pady=(7, 0))
-
-        ttk.Separator(action, orient="horizontal").grid(
-            row=2, column=0, columnspan=3, sticky="ew", pady=7
-        )
-        ttk.Label(action, text="Режим:").grid(row=3, column=0, sticky="w")
-        ttk.Radiobutton(
-            action, text="AUTO", value="AUTO", variable=self.control_mode_var,
-            command=self._on_mode_change
-        ).grid(row=3, column=1, sticky="w")
-        ttk.Radiobutton(
-            action, text="MANUAL", value="MANUAL", variable=self.control_mode_var,
-            command=self._on_mode_change
-        ).grid(row=3, column=2, sticky="w")
-
-        up = ttk.Button(action, text="▲ Вверх")
-        left = ttk.Button(action, text="◀ Влево")
-        center = ttk.Button(action, text="Центр 90/90", command=self.manual_center)
-        right_btn = ttk.Button(action, text="Вправо ▶")
-        down = ttk.Button(action, text="▼ Вниз")
-
-        up.grid(row=4, column=1, sticky="ew", padx=3, pady=(7, 2))
-        left.grid(row=5, column=0, sticky="ew", padx=(0, 3), pady=2)
-        center.grid(row=5, column=1, sticky="ew", padx=3, pady=2)
-        right_btn.grid(row=5, column=2, sticky="ew", padx=(3, 0), pady=2)
-        down.grid(row=6, column=1, sticky="ew", padx=3, pady=2)
-
-        self._bind_manual_button(up, 0, -1)
-        self._bind_manual_button(down, 0, +1)
-        self._bind_manual_button(left, -1, 0)
-        self._bind_manual_button(right_btn, +1, 0)
-        self.manual_buttons = [up, down, left, right_btn, center]
-
-        ttk.Label(
-            action,
-            text="MANUAL: кнопки или стрелки клавиатуры; удержание = плавное движение",
-            wraplength=340,
-            justify="left",
-        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(5, 0))
-
-        settings_tabs = ttk.Notebook(right)
-        settings_tabs.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
-
-        depth = ttk.Frame(settings_tabs, padding=8)
-        pred = ttk.Frame(settings_tabs, padding=8)
-        servo = ttk.Frame(settings_tabs, padding=8)
-        settings_tabs.add(depth, text="ToF / объект")
-        settings_tabs.add(pred, text="Фильтр / прогноз")
-        settings_tabs.add(servo, text="Сервоприводы")
-        self._entry(depth, 0, "Мин. дальность, мм", "min_distance_mm")
-        self._entry(depth, 1, "Макс. дальность, мм", "max_distance_mm")
-        self._entry(depth, 2, "Порог confidence", "confidence_threshold")
-        self._entry(depth, 3, "Мин. площадь, px", "min_object_area_px")
-        self._entry(depth, 4, "Morph kernel (odd)", "morphology_kernel")
-        self._entry(depth, 5, "Кадров до LOCK", "stable_frames")
-        self._entry(depth, 6, "Допуск потерь, кадров", "lost_tolerance_frames")
-        self._entry(depth, 7, "Радиус reacquire, px", "reacquire_radius_px")
-        self._entry(depth, 8, "Макс. скачок Z, мм", "max_depth_jump_mm")
-
-        self._entry(pred, 0, "Alpha", "filter_alpha")
-        self._entry(pred, 1, "Beta", "filter_beta")
-        self._entry(pred, 2, "Прогноз, кадров", "prediction_frames")
-        self._entry(pred, 3, "Max XY speed, px/s", "max_pixel_speed_px_s")
-        self._entry(pred, 4, "Max Z speed, m/s", "max_depth_speed_m_s")
-
-        self._arduino_port_selector(servo, 0)
-        ttk.Label(
-            servo, textvariable=self.arduino_port_info_var, wraplength=330, justify="left"
-        ).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 5))
-
-        self._entry(servo, 2, "X min", "servo_x_min")
-        self._entry(servo, 3, "X max", "servo_x_max")
-        self._entry(servo, 4, "Y min", "servo_y_min")
-        self._entry(servo, 5, "Y max", "servo_y_max")
-        self._entry(servo, 6, "Gain X, deg/s", "servo_gain_x_deg_s")
-        self._entry(servo, 7, "Gain Y, deg/s", "servo_gain_y_deg_s")
-        self._entry(servo, 8, "Max slew, deg/s", "servo_max_rate_deg_s")
-        self._entry(servo, 9, "Servo update, Hz", "servo_update_hz")
-        self._entry(servo, 10, "Deadband, px", "deadband_px")
-        self._entry(servo, 11, "Center delay, s", "return_center_delay_s")
-        self._entry(servo, 12, "Manual step, deg", "manual_step_deg")
-        self._entry(servo, 13, "Manual speed, deg/s", "manual_rate_deg_s")
-
-        self._check(servo, 14, "Servo control", "servo_enabled")
-        self._check(servo, 15, "Invert X", "invert_x")
-        self._check(servo, 16, "Invert Y", "invert_y")
-        self._check(servo, 17, "Центрировать при потере", "return_center_on_loss")
-
-        error = ttk.LabelFrame(right, text="Диагностика", padding=8)
-        error.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        ttk.Label(error, textvariable=self.error_var, wraplength=350, justify="left").pack(fill="x")
-
-    def _arduino_port_selector(self, parent, row: int) -> None:
-        """Editable selector: detected ports are listed, but manual entry is allowed."""
-        parent.columnconfigure(1, weight=1)
-        ttk.Label(parent, text="Arduino port").grid(
-            row=row, column=0, sticky="w", pady=2, padx=(0, 8)
-        )
-        var = tk.StringVar(value=ARDUINO_DEFAULT_PORT)
-        self.vars["arduino_port"] = var
-        self.arduino_port_combo = ttk.Combobox(
-            parent, textvariable=var, state="normal", width=22
-        )
-        self.arduino_port_combo.grid(row=row, column=1, sticky="ew", pady=2)
-        self.arduino_port_combo.bind("<<ComboboxSelected>>", self._on_arduino_port_selected)
-        ttk.Button(parent, text="Обновить / авто", command=self.refresh_arduino_ports).grid(
-            row=row, column=2, sticky="ew", padx=(6, 0), pady=2
-        )
-
-    @staticmethod
-    def _port_description(port) -> str:
-        parts = []
-        description = (getattr(port, "description", "") or "").strip()
-        manufacturer = (getattr(port, "manufacturer", "") or "").strip()
-        product = (getattr(port, "product", "") or "").strip()
-        if description and description.lower() != "n/a":
-            parts.append(description)
-        if manufacturer and manufacturer.lower() not in " ".join(parts).lower():
-            parts.append(manufacturer)
-        if product and product.lower() not in " ".join(parts).lower():
-            parts.append(product)
-        return " / ".join(parts) if parts else "неизвестное USB/serial устройство"
-
-    def _on_arduino_port_selected(self, _event=None) -> None:
-        device = str(self.vars["arduino_port"].get()).strip()
-        port = self._serial_ports_by_device.get(device)
-        if port is None:
-            self.arduino_port_info_var.set(f"Выбран порт: {device} (введён вручную)")
-            return
-        self.arduino_port_info_var.set(
-            f"Выбран: {device} — {self._port_description(port)}"
-        )
-
-    def refresh_arduino_ports(self, auto_select: bool = False) -> None:
-        """Rescan serial ports and optionally choose the most likely Arduino."""
-        try:
-            ports = list(list_ports.comports())
-        except Exception as exc:
-            self.arduino_port_info_var.set(f"Ошибка сканирования serial-портов: {exc}")
-            return
-
-        ports.sort(key=lambda p: (-serial_port_score(p), str(getattr(p, "device", ""))))
-        self._serial_ports_by_device = {p.device: p for p in ports if getattr(p, "device", None)}
-        devices = list(self._serial_ports_by_device)
-        if self.arduino_port_combo is not None:
-            self.arduino_port_combo.configure(values=devices)
-
-        current = str(self.vars["arduino_port"].get()).strip()
-        selected = current
-
-        best_is_plausible = bool(ports) and (serial_port_score(ports[0]) > 0 or len(ports) == 1)
-        if auto_select:
-            # At startup, prefer a detected likely Arduino instead of assuming ttyACM0.
-            if best_is_plausible:
-                selected = ports[0].device
-        elif current not in self._serial_ports_by_device:
-            # After unplug/replug the Linux device index can change (ACM0 -> ACM1).
-            # Automatically recover when there is a plausible replacement.
-            if best_is_plausible:
-                selected = ports[0].device
-            elif not current:
-                selected = ARDUINO_DEFAULT_PORT
-
-        if selected:
-            self.vars["arduino_port"].set(selected)
-
-        if not ports:
-            self.arduino_port_info_var.set(
-                "Serial-порты не найдены. Можно ввести путь вручную и нажать Старт."
-            )
-            return
-
-        best = ports[0]
-        selected_port = self._serial_ports_by_device.get(selected)
-        if selected_port is not None:
-            prefix = "Автовыбор" if auto_select else "Выбран"
-            self.arduino_port_info_var.set(
-                f"{prefix}: {selected_port.device} — {self._port_description(selected_port)}; "
-                f"найдено портов: {len(ports)}"
-            )
-        else:
-            self.arduino_port_info_var.set(
-                f"Найдено портов: {len(ports)}. Наиболее вероятный Arduino: "
-                f"{best.device} — {self._port_description(best)}"
-            )
-
-    def _entry(self, parent, row: int, label: str, key: str) -> None:
-        parent.columnconfigure(1, weight=1)
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2, padx=(0, 8))
-        var = tk.StringVar()
-        self.vars[key] = var
-        ttk.Entry(parent, textvariable=var, width=16).grid(row=row, column=1, sticky="ew", pady=2)
-
-    def _check(self, parent, row: int, label: str, key: str) -> None:
-        var = tk.BooleanVar()
-        self.vars[key] = var
-        ttk.Checkbutton(parent, text=label, variable=var).grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
-
-    def _load_config_to_ui(self, cfg: RuntimeConfig) -> None:
-        for key, var in self.vars.items():
-            value = getattr(cfg, key)
-            var.set(value)
-        self.control_mode_var.set(cfg.control_mode)
-        self._update_manual_controls_state()
-
-    def _read_config_from_ui(self) -> RuntimeConfig:
-        def f(key: str) -> float:
-            return float(self.vars[key].get())
-
-        def i(key: str) -> int:
-            return int(round(float(self.vars[key].get())))
-
-        cfg = RuntimeConfig(
-            min_distance_mm=f("min_distance_mm"),
-            max_distance_mm=f("max_distance_mm"),
-            confidence_threshold=f("confidence_threshold"),
-            min_object_area_px=i("min_object_area_px"),
-            morphology_kernel=i("morphology_kernel"),
-            stable_frames=i("stable_frames"),
-            lost_tolerance_frames=i("lost_tolerance_frames"),
-            reacquire_radius_px=f("reacquire_radius_px"),
-            max_depth_jump_mm=f("max_depth_jump_mm"),
-            filter_alpha=f("filter_alpha"),
-            filter_beta=f("filter_beta"),
-            prediction_frames=i("prediction_frames"),
-            max_pixel_speed_px_s=f("max_pixel_speed_px_s"),
-            max_depth_speed_m_s=f("max_depth_speed_m_s"),
-            # Port is consumed when the worker starts; restart after changing it.
-            arduino_port=str(self.vars["arduino_port"].get()).strip(),
-            servo_enabled=bool(self.vars["servo_enabled"].get()),
-            servo_x_min=f("servo_x_min"),
-            servo_x_max=f("servo_x_max"),
-            servo_y_min=f("servo_y_min"),
-            servo_y_max=f("servo_y_max"),
-            servo_gain_x_deg_s=f("servo_gain_x_deg_s"),
-            servo_gain_y_deg_s=f("servo_gain_y_deg_s"),
-            servo_max_rate_deg_s=f("servo_max_rate_deg_s"),
-            servo_update_hz=f("servo_update_hz"),
-            deadband_px=f("deadband_px"),
-            invert_x=bool(self.vars["invert_x"].get()),
-            invert_y=bool(self.vars["invert_y"].get()),
-            return_center_on_loss=bool(self.vars["return_center_on_loss"].get()),
-            return_center_delay_s=f("return_center_delay_s"),
-            control_mode=str(self.control_mode_var.get()).strip().upper(),
-            manual_step_deg=f("manual_step_deg"),
-            manual_rate_deg_s=f("manual_rate_deg_s"),
-        )
-        self._validate_config(cfg)
-        return cfg
-
-    @staticmethod
-    def _validate_config(cfg: RuntimeConfig) -> None:
-        if not (0 <= cfg.min_distance_mm < cfg.max_distance_mm <= SENSOR_RANGE_MM):
-            raise ValueError(f"Дальность: 0 <= min < max <= {SENSOR_RANGE_MM} мм")
-        if not (0 <= cfg.confidence_threshold <= 255):
-            raise ValueError("confidence должен быть в диапазоне 0..255")
-        if cfg.min_object_area_px < 1:
-            raise ValueError("Минимальная площадь должна быть >= 1")
-        if cfg.morphology_kernel < 1 or cfg.morphology_kernel > 15:
-            raise ValueError("Morph kernel должен быть 1..15")
-        if cfg.stable_frames < 1 or cfg.lost_tolerance_frames < 0:
-            raise ValueError("Некорректные параметры устойчивости")
-        if cfg.reacquire_radius_px <= 0 or cfg.max_depth_jump_mm <= 0:
-            raise ValueError("Reacquire/depth gate должны быть > 0")
-        if not (0.0 < cfg.filter_alpha <= 1.0):
-            raise ValueError("Alpha должен быть (0, 1]")
-        if not (0.0 <= cfg.filter_beta <= 1.0):
-            raise ValueError("Beta должен быть [0, 1]")
-        if cfg.prediction_frames < 0:
-            raise ValueError("Prediction frames должен быть >= 0")
-        if not (0 <= cfg.servo_x_min <= SERVO_CENTER_X <= cfg.servo_x_max <= 180):
-            raise ValueError("X limits должны содержать 90° и лежать в 0..180")
-        if not (0 <= cfg.servo_y_min <= SERVO_CENTER_Y <= cfg.servo_y_max <= 180):
-            raise ValueError("Y limits должны содержать 90° и лежать в 0..180")
-        if cfg.servo_max_rate_deg_s <= 0 or cfg.servo_update_hz <= 0:
-            raise ValueError("Servo rate/update должны быть > 0")
-        if cfg.control_mode not in ("AUTO", "MANUAL"):
-            raise ValueError("Режим управления должен быть AUTO или MANUAL")
-        if not (0.05 <= cfg.manual_step_deg <= 30.0):
-            raise ValueError("Manual step должен быть в диапазоне 0.05..30 градусов")
-        if not (0.1 <= cfg.manual_rate_deg_s <= 180.0):
-            raise ValueError("Manual speed должен быть в диапазоне 0.1..180 deg/s")
-        if not cfg.arduino_port:
-            raise ValueError("Укажите Arduino port")
-
-    def _update_manual_controls_state(self) -> None:
-        running = self.worker is not None and self.worker.is_alive()
-        state = "normal" if self.control_mode_var.get() == "MANUAL" and running else "disabled"
-        for button in self.manual_buttons:
-            try:
-                button.configure(state=state)
-            except tk.TclError:
-                pass
-
-    def _on_mode_change(self) -> None:
-        mode = self.control_mode_var.get().strip().upper()
-        if mode not in ("AUTO", "MANUAL"):
-            return
-        cfg = self.shared.get_config()
-        cfg.control_mode = mode
-        self.shared.set_config(cfg)
-        self.shared.clear_manual_input()
-        self._pressed_manual_keys.clear()
-        self._update_manual_controls_state()
-        self.error_var.set(
-            "MANUAL: автотрекинг продолжает считать цель, но не двигает подвес"
-            if mode == "MANUAL"
-            else "AUTO: управление сервоприводами передано автотрекеру"
-        )
-
-    def _manual_available(self) -> bool:
-        return (
-            self.control_mode_var.get() == "MANUAL"
-            and self.worker is not None
-            and self.worker.is_alive()
-        )
-
-    def _manual_press(self, x: int, y: int) -> None:
-        if not self._manual_available():
-            return
-        cfg = self.shared.get_config()
-        # A one-shot nudge guarantees that a short click/tap is not lost.
-        self.shared.queue_manual_nudge(x * cfg.manual_step_deg, y * cfg.manual_step_deg)
-        self.shared.set_manual_direction(x, y)
-
-    def _manual_release(self) -> None:
-        self.shared.set_manual_direction(0, 0)
-
-    def _bind_manual_button(self, button: ttk.Button, x: int, y: int) -> None:
-        button.bind("<ButtonPress-1>", lambda _e, dx=x, dy=y: self._manual_press(dx, dy))
-        button.bind("<ButtonRelease-1>", lambda _e: self._manual_release())
-        button.bind("<Leave>", lambda _e: self._manual_release())
-
-    def manual_center(self) -> None:
-        if not self._manual_available():
-            return
-        self.shared.set_manual_direction(0, 0)
-        self.shared.request_manual_center()
-
-    def _bind_manual_keyboard(self) -> None:
-        mapping = {
-            "Left": (-1, 0),
-            "Right": (+1, 0),
-            "Up": (0, -1),
-            "Down": (0, +1),
-        }
-        for key, (x, y) in mapping.items():
-            self.root.bind_all(
-                f"<KeyPress-{key}>",
-                lambda event, k=key, dx=x, dy=y: self._manual_key_press(event, k, dx, dy),
-                add="+",
-            )
-            self.root.bind_all(
-                f"<KeyRelease-{key}>",
-                lambda event, k=key: self._manual_key_release(event, k),
-                add="+",
-            )
-        self.root.bind_all("<KeyPress-Home>", self._manual_home_key, add="+")
-
-    def _keyboard_control_allowed(self) -> bool:
-        if not self._manual_available():
-            return False
-        focus = self.root.focus_get()
-        # Do not hijack cursor movement while the user edits an Entry/Text.
-        if isinstance(focus, (tk.Entry, ttk.Entry, tk.Text)):
-            return False
-        return True
-
-    def _sync_manual_keyboard_direction(self) -> None:
-        vectors = {
-            "Left": (-1, 0),
-            "Right": (+1, 0),
-            "Up": (0, -1),
-            "Down": (0, +1),
-        }
-        x = sum(vectors[k][0] for k in self._pressed_manual_keys if k in vectors)
-        y = sum(vectors[k][1] for k in self._pressed_manual_keys if k in vectors)
-        self.shared.set_manual_direction(int(clamp(x, -1, 1)), int(clamp(y, -1, 1)))
-
-    def _manual_key_press(self, event, key: str, x: int, y: int):
-        if not self._keyboard_control_allowed():
-            return None
-        # Ignore OS key-repeat for the nudge. The held direction still remains set.
-        if key not in self._pressed_manual_keys:
-            self._pressed_manual_keys.add(key)
-            cfg = self.shared.get_config()
-            self.shared.queue_manual_nudge(x * cfg.manual_step_deg, y * cfg.manual_step_deg)
-        self._sync_manual_keyboard_direction()
-        return "break"
-
-    def _manual_key_release(self, event, key: str):
-        if key in self._pressed_manual_keys:
-            self._pressed_manual_keys.discard(key)
-            self._sync_manual_keyboard_direction()
-            return "break"
-        return None
-
-    def _manual_home_key(self, event):
-        if not self._keyboard_control_allowed():
-            return None
-        self.manual_center()
-        return "break"
-
-    def apply_settings(self) -> None:
-        try:
-            cfg = self._read_config_from_ui()
-            self.shared.set_config(cfg)
-            self.shared.clear_manual_input()
-            self._pressed_manual_keys.clear()
-            self._update_manual_controls_state()
-            self.error_var.set("Настройки применены")
-        except Exception as exc:
-            self.error_var.set(f"Ошибка настроек: {exc}")
-            messagebox.showerror("Настройки", str(exc))
-
-    def start_system(self) -> None:
-        if self.worker is not None and self.worker.is_alive():
-            return
-        # Refresh immediately before connecting so unplug/replug or ttyACM index
-        # changes do not require restarting the GUI. Keep an explicit manual
-        # selection if it still exists; otherwise choose the best detected port.
-        current_port = str(self.vars["arduino_port"].get()).strip()
-        try:
-            detected_now = {p.device for p in list_ports.comports()}
+                    time.sleep(.01)
+            if not board.get_firmata_version():
+                raise RuntimeError("Нет ответа Firmata. Загрузите StandardFirmata в Arduino Uno.")
+            if cancelled():
+                raise RuntimeError("Подключение отменено до включения сервоприводов")
+            # servo_config attaches at 90, avoiding get_pin's default attach-at-zero.
+            board.servo_config(9, angle=90)
+            board.servo_config(10, angle=90)
+            self.pins = [board.digital[9], board.digital[10]]
+            board.sp.write_timeout = .2
+            self.board, self.port = board, port
+            self.angles[:] = 90
+            self.velocity[:] = 0
+            self.sent[:] = 90
         except Exception:
-            detected_now = set()
-        if not current_port or (current_port.startswith("/dev/") and current_port not in detected_now):
-            self.refresh_arduino_ports(auto_select=True)
-        try:
-            cfg = self._read_config_from_ui()
-            self.shared.set_config(cfg)
-        except Exception as exc:
-            messagebox.showerror("Настройки", str(exc))
+            if board is not None:
+                try:
+                    board.exit()
+                except Exception:
+                    if getattr(board, 'sp', None):
+                        board.sp.close()
+            raise
+
+    def move(self, desired, dt, cfg):
+        limits_low = np.array([cfg.x_min, cfg.y_min])
+        limits_high = np.array([cfg.x_max, cfg.y_max])
+        desired = np.clip(desired, limits_low, limits_high)
+        dt = min(max(dt, 0), .1)
+        if dt <= 0 or not self.connected:
+            self.velocity[:] = 0
             return
+        delta = desired - self.angles
+        requested = np.clip(delta / dt, -cfg.max_speed, cfg.max_speed)
+        self.velocity += np.clip(requested - self.velocity,
+                                 -cfg.max_acceleration * dt, cfg.max_acceleration * dt)
+        step = self.velocity * dt
+        # Do not coast away from a newly requested hold/reversal point.
+        step = np.where(step * delta > 0, np.sign(step) * np.minimum(abs(step), abs(delta)), 0)
+        self.angles = np.clip(self.angles + step, limits_low, limits_high)
+        now = time.monotonic()
+        rounded = np.rint(self.angles).astype(int)
+        # Limits may be fractional; integer Firmata commands must still stay inside.
+        rounded = np.clip(rounded, np.ceil(limits_low), np.floor(limits_high)).astype(int)
+        if now - self.last_write >= .02 and np.any(rounded != self.sent):
+            if self.board:
+                for pin, angle in zip(self.pins, rounded):
+                    pin.write(int(angle))
+            self.sent = rounded.astype(float)
+            self.last_write = now
 
-        self.worker = TrackerWorker(self.shared)
+    def hold(self):
+        self.velocity[:] = 0
+
+    def close(self):
+        board, self.board = self.board, None
+        if board:
+            try:
+                board.exit()
+            finally:
+                if getattr(board, 'sp', None):
+                    board.sp.close()
+        if not self.demo:
+            self.port = 'не подключено'
+
+
+class Camera:
+    def __init__(self, cfg, demo=False):
+        self.demo, self.cam, self.started = demo, None, False
+        self.cfg, self.quality_name = cfg, 'demo'
+        self.rng = np.random.default_rng(7)
+        self.begin = time.monotonic()
+        if demo:
+            return
+        import ArducamDepthCamera as ac
+        self.ac = ac
+        self.cam = ac.ArducamCamera()
+        try:
+            self.check(self.cam.open(getattr(ac.Connection, cfg.connection), cfg.camera_index), 'open')
+            self.check(self.cam.start(ac.FrameType.DEPTH), 'start')
+            self.started = True
+            self.check(self.cam.setControl(ac.Control.RANGE, cfg.sdk_range), 'RANGE')
+            actual = self.cam.getControl(ac.Control.RANGE)
+            if int(actual) != cfg.sdk_range:
+                raise RuntimeError(f"SDK вернул RANGE={actual}, ожидался {cfg.sdk_range}")
+            self.info = self.cam.getCameraInfo()
+            self.quality_name = cfg.quality
+            if cfg.quality == 'auto':
+                self.quality_name = 'confidence' if self.info.device_type == ac.DeviceType.VGA else 'amplitude'
+        except Exception:
+            self.close()
+            raise
+
+    @staticmethod
+    def check(result, name):
+        value = getattr(result, 'value', result)
+        if value is not None and value != 0:
+            raise RuntimeError(f"Arducam {name}: {result}")
+
+    def read(self, angles, cfg):
+        if self.demo:
+            time.sleep(1 / 30)
+            h, w = 180, 240
+            depth = np.full((h, w), 3.8, np.float32)
+            t = time.monotonic() - self.begin
+            R = rotation(angles, cfg)
+            intr = intrinsics(depth.shape, cfg)
+            # A metric moving object plus a farther stationary object.
+            for point, size in [(np.array([.48 * math.sin(t * .5), .15 * math.cos(t * .7), 1.65 + .25 * math.sin(t * .35)]), .12),
+                                (np.array([-.65, .15, 2.8]), .16)]:
+                p = R.T @ point
+                uv = project(p, intr)
+                if uv is not None and max(abs(uv)) < 10000:
+                    rx, ry = max(2, int(size * intr[0] / p[2])), max(2, int(size * intr[1] / p[2]))
+                    cv2.ellipse(depth, tuple(np.rint(uv).astype(int)), (rx, ry), 0, 0, 360, float(p[2]), -1)
+            depth += self.rng.normal(0, .006, depth.shape).astype(np.float32)
+            return depth, np.full(depth.shape, 100, np.float32), time.monotonic(), 0.
+        start = time.monotonic()
+        frame = self.cam.requestFrame(150)
+        received = time.monotonic()
+        if frame is None:
+            return None
+        try:
+            if not isinstance(frame, self.ac.DepthData):
+                return None
+            # SDK owns buffers: copies MUST happen before releaseFrame.
+            depth = np.array(frame.depth_data, dtype=np.float32, copy=True) / 1000.
+            quality = None
+            if self.quality_name != 'off':
+                name = self.quality_name + '_data'
+                data = getattr(frame, name, None)
+                if data is None or np.size(data) != depth.size:
+                    raise RuntimeError(f"SDK не предоставляет {name}; выберите другой фильтр качества")
+                quality = np.array(data, dtype=np.float32, copy=True).reshape(depth.shape)
+            if depth.ndim != 2 or not depth.size:
+                raise RuntimeError("SDK вернул некорректную карту глубины")
+            return depth, quality, received, received - start
+        finally:
+            self.cam.releaseFrame(frame)
+
+    def close(self):
+        cam, self.cam = self.cam, None
+        if cam:
+            try:
+                if self.started:
+                    cam.stop()
+            finally:
+                cam.close()
+
+
+class Shared:
+    def __init__(self, cfg):
+        self.lock = threading.Lock()
+        self.cfg, self.revision = cfg, 0
+        self.mode = 'manual'
+        self.heartbeat = time.monotonic()
+        self.emergency = threading.Event()
+        self.stop = threading.Event()
+        self.actions = queue.Queue(maxsize=32)
+        self.frames = queue.Queue(maxsize=1)
+        self.events = queue.Queue()
+
+    def snapshot(self):
+        with self.lock:
+            return self.cfg, self.revision, self.mode, self.heartbeat
+
+    def publish(self, packet):
+        try:
+            self.frames.get_nowait()
+        except queue.Empty:
+            pass
+        self.frames.put_nowait(packet)
+
+    def event(self, message):
+        self.events.put(message)
+        LOG.info(message)
+
+
+class Worker(threading.Thread):
+    def __init__(self, shared, demo=False):
+        super().__init__(name='ToF acquisition and control', daemon=True)
+        self.s, self.demo = shared, demo
+        self.gimbal, self.camera = Gimbal(demo), None
+        self.csv_file = self.csv_writer = None
+
+    def open_csv(self, path):
+        if self.csv_file:
+            self.csv_file.close()
+        self.csv_file = self.csv_writer = None
+        if path:
+            self.csv_file = open(path, 'w', newline='', encoding='utf-8')
+            self.csv_writer = csv.writer(self.csv_file)
+            self.csv_writer.writerow(['utc_host', 'monotonic_host_s', 'mode', 'state', 'track_id',
+                'range_m', 'projected_area_m2', 'base_vx_m_s', 'base_vy_m_s', 'base_vz_m_s',
+                'range_rate_m_s', 'prediction_s', 'prediction_sigma_m', 'x_command_deg',
+                'y_command_deg', 'processing_age_s', 'fps', 'config_json'])
+            self.csv_file.flush()
+
+    def run(self):
+        s = self.s
+        cfg, revision, _, _ = s.snapshot()
+        tracker = Tracker()
+        desired = np.array([90., 90.])
+        last_control, last_frame, last_flush = time.monotonic(), time.monotonic(), 0.
+        previous_mode = 'manual'
+        try:
+            self.camera = Camera(cfg, self.demo)
+            s.event(f"Камера готова; качество: {self.camera.quality_name}")
+            if s.stop.is_set():
+                return
+            try:
+                self.gimbal.connect(cfg.port, lambda: s.stop.is_set() or s.emergency.is_set())
+                s.event(f"Arduino: {self.gimbal.port}; центр 90° / 90°")
+            except Exception as exc:
+                s.event(f"Arduino: {exc}. Просмотр работает; доступно переподключение.")
+            while not s.stop.is_set():
+                cfg, new_revision, mode, heartbeat = s.snapshot()
+                if new_revision != revision:
+                    tracker = Tracker()
+                    desired = self.gimbal.angles.copy()
+                    revision = new_revision
+                if mode != previous_mode:
+                    desired = self.gimbal.angles.copy()
+                    self.gimbal.hold()
+                    previous_mode = mode
+                frozen = s.emergency.is_set() or time.monotonic() - heartbeat > .6
+                if frozen:
+                    desired = self.gimbal.angles.copy()
+                    self.gimbal.hold()
+                while True:
+                    try:
+                        action, value = s.actions.get_nowait()
+                    except queue.Empty:
+                        break
+                    if action == 'csv':
+                        try:
+                            self.open_csv(value)
+                            s.event('Запись CSV включена' if value else 'Запись CSV выключена')
+                        except OSError as exc:
+                            try:
+                                self.open_csv(None)
+                            except OSError:
+                                pass
+                            s.event(f"CSV: {exc}")
+                    elif action == 'connect':
+                        with s.lock:
+                            s.mode = 'manual'
+                        mode = 'manual'
+                        try:
+                            self.gimbal.connect(cfg.port, lambda: s.stop.is_set() or s.emergency.is_set())
+                            desired = self.gimbal.angles.copy()
+                            tracker = Tracker()
+                            s.event(f"Arduino: {self.gimbal.port}")
+                        except Exception as exc:
+                            s.event(f"Arduino: {exc}")
+                    elif not frozen and mode == 'manual':
+                        if action == 'center':
+                            desired[:] = 90
+                        elif action == 'step':
+                            desired += np.array(value) * cfg.manual_step * np.array([
+                                -1 if cfg.invert_x else 1, -1 if cfg.invert_y else 1])
+                desired = np.clip(desired, [cfg.x_min, cfg.y_min], [cfg.x_max, cfg.y_max])
+                pose = self.gimbal.angles.copy()
+                packet = self.camera.read(pose, cfg)
+                now = time.monotonic()
+                dt_control, last_control = min(now - last_control, .1), now
+                # Re-read stop/heartbeat after any blocking SDK/serial operation.
+                _, _, live_mode, heartbeat = s.snapshot()
+                frozen = s.emergency.is_set() or s.stop.is_set() or now - heartbeat > .6
+                if live_mode != mode:
+                    mode = live_mode
+                    desired = self.gimbal.angles.copy()
+                if packet is None:
+                    self.gimbal.hold()
+                    if mode == 'manual' and not frozen:
+                        self.gimbal.move(desired, dt_control, cfg)
+                    if now - last_frame > cfg.stale_time:
+                        s.publish((None, {'state': 'НЕТ КАДРОВ • автоматическое движение остановлено',
+                                          'port': self.gimbal.port, 'angles': self.gimbal.angles.copy()}))
+                    continue
+                depth, quality, stamp, request_delay = packet
+                last_frame = now
+                detections, valid, capped = detect(depth, quality, cfg)
+                R = rotation(pose, cfg)
+                target = tracker.update(detections, stamp, R, cfg)
+                age = time.monotonic() - stamp
+                horizon = min(cfg.horizon_frames * tracker.period + cfg.latency + age, cfg.horizon_max)
+                future_uv = None
+                sigma = None
+                future_camera = None
+                state = 'ПОИСК • подтверждение объекта'
+                if target:
+                    future, sigma = target.kf.future(horizon, cfg)
+                    future_camera = R.T @ future
+                    future_uv = project(future_camera, intrinsics(depth.shape, cfg))
+                    state = 'СОПРОВОЖДЕНИЕ' if target.visible else 'ПОТЕРЯ • ожидание объекта'
+                    if sigma > cfg.max_sigma:
+                        state = 'ПРОГНОЗ НЕУВЕРЕННЫЙ • удержание'
+                fresh = age + request_delay <= cfg.stale_time
+                if not fresh:
+                    state = 'КАДР УСТАРЕЛ • удержание'
+                if mode == 'auto':
+                    desired = self.gimbal.angles.copy()
+                    if (target and target.visible and fresh and not frozen and future_uv is not None
+                            and sigma <= cfg.max_sigma and
+                            cfg.near <= (np.linalg.norm(future_camera) if cfg.radial_depth else future_camera[2]) <= cfg.far):
+                        errors = np.degrees(np.arctan2(future_camera[:2], future_camera[2]))
+                        errors = np.where(abs(errors) > cfg.deadband, errors - np.sign(errors) * cfg.deadband, 0)
+                        signs = np.array([-1 if cfg.invert_x else 1, -1 if cfg.invert_y else 1])
+                        desired += errors * cfg.gain * dt_control * signs
+                _, _, latest_mode, heartbeat = s.snapshot()
+                frozen |= (s.emergency.is_set() or s.stop.is_set() or
+                           time.monotonic() - heartbeat > .6 or latest_mode != mode)
+                if frozen:
+                    self.gimbal.hold()
+                    state = 'СТОП • команды движения заблокированы'
+                else:
+                    try:
+                        self.gimbal.move(desired, dt_control, cfg)
+                    except Exception as exc:
+                        s.emergency.set()
+                        s.event(f"Ошибка связи Arduino: {exc}. Движение заблокировано.")
+                        try:
+                            self.gimbal.close()
+                        except Exception:
+                            LOG.exception('Arduino close')
+                image = self.render(depth, valid, detections, target, future_uv, cfg)
+                telemetry = dict(state=state, port=self.gimbal.port, angles=self.gimbal.angles.copy(),
+                    fps=1 / tracker.period, age=age, horizon=horizon, sigma=sigma,
+                    count=len(detections), quality=self.camera.quality_name, capped=capped,
+                    range=None, area=None, speed=None, radial=None, id=None)
+                velocity = [None] * 3
+                if target:
+                    velocity = target.kf.x[3:]
+                    distance = float(np.linalg.norm(target.kf.x[:3]))
+                    telemetry.update(id=target.id, range=distance, area=target.detection.area,
+                                     speed=float(np.linalg.norm(velocity)),
+                                     radial=float(target.kf.x[:3] @ velocity / max(distance, .001)))
+                s.publish((image, telemetry))
+                if self.csv_writer:
+                    try:
+                        self.csv_writer.writerow([datetime.now(timezone.utc).isoformat(), stamp, mode, state,
+                            telemetry['id'], telemetry['range'], telemetry['area'], *velocity,
+                            telemetry['radial'], horizon, sigma, *self.gimbal.angles, age,
+                            telemetry['fps'], json.dumps(asdict(cfg), ensure_ascii=False)])
+                        if now - last_flush >= 1:
+                            self.csv_file.flush()
+                            last_flush = now
+                    except OSError as exc:
+                        s.event(f"Запись CSV остановлена: {exc}")
+                        self.open_csv(None)
+        except Exception as exc:
+            LOG.exception('Worker stopped')
+            s.event(f"Остановлено: {exc}")
+            s.publish((None, {'state': f'ОШИБКА: {exc}', 'port': self.gimbal.port,
+                              'angles': self.gimbal.angles.copy()}))
+        finally:
+            for close in (lambda: self.open_csv(None), self.gimbal.close,
+                          lambda: self.camera.close() if self.camera else None):
+                try:
+                    close()
+                except Exception:
+                    LOG.exception('Resource cleanup')
+            s.event('Поток оборудования завершён')
+
+    @staticmethod
+    def render(depth, valid, detections, target, future_uv, cfg):
+        value = np.nan_to_num((depth - cfg.near) / (cfg.far - cfg.near), nan=1, posinf=1, neginf=0)
+        image = cv2.applyColorMap((255 * (1 - np.clip(value, 0, 1))).astype(np.uint8), cv2.COLORMAP_TURBO)
+        image[~valid] = (23, 19, 15)
+        h, w = depth.shape
+        for d in detections:
+            x, y, bw, bh = d.box
+            cv2.rectangle(image, (x, y), (x + bw - 1, y + bh - 1), (125, 125, 125), 1)
+        cv2.drawMarker(image, (w // 2, h // 2), (230, 230, 230), cv2.MARKER_CROSS, 14, 1)
+        if target and target.visible:
+            x, y, bw, bh = target.detection.box
+            cv2.rectangle(image, (x, y), (x + bw - 1, y + bh - 1), (100, 255, 110), 2)
+            p = tuple(np.rint(target.detection.uv).astype(int))
+            cv2.circle(image, p, 3, (255, 255, 255), -1)
+            if future_uv is not None:
+                q = tuple(np.rint(np.clip(future_uv, [-w, -h], [2*w, 2*h])).astype(int))
+                cv2.arrowedLine(image, p, q, (255, 225, 30), 1, tipLength=.2)
+                if 0 <= q[0] < w and 0 <= q[1] < h:
+                    cv2.drawMarker(image, q, (255, 225, 30), cv2.MARKER_DIAMOND, 10, 1)
+            cv2.putText(image, f'ID {target.id}  {target.detection.distance:.2f} m',
+                        (max(0, x), max(12, y - 4)), cv2.FONT_HERSHEY_SIMPLEX, .35, (255, 255, 255), 1)
+        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+# All widget access belongs exclusively to the Tk thread.
+GROUPS = {
+    'Объект': [
+        ('near', 'Ближняя граница, м'), ('far', 'Дальняя граница, м'),
+        ('area_min', 'Мин. проекция, м²'), ('area_max', 'Макс. проекция, м²'),
+        ('pixels_min', 'Мин. площадь, пикс.'), ('frame_fraction', 'Макс. доля кадра, 0–1'),
+        ('depth_gap', 'Связность по глубине, м'), ('quality_min', 'Порог качества, ед. SDK'),
+        ('confirm', 'Подтверждение, кадров'), ('lost_time', 'Память потери, с'),
+        ('association', 'Ворота сопоставления, м'), ('switch_margin', 'Ближе текущего на, м'),
+        ('switch_frames', 'Подтверждение смены, кадров')],
+    'Прогноз': [
+        ('horizon_frames', 'Прогноз на N кадров'), ('horizon_max', 'Макс. горизонт, с'),
+        ('latency', 'Доп. задержка системы, с'), ('measurement_noise', 'Шум измерения σ, м'),
+        ('acceleration_noise', 'Шум ускорения σ, м/с²'), ('max_sigma', 'Допуск σ прогноза, м'),
+        ('fov_x', 'Угол обзора X, °'), ('fov_y', 'Угол обзора Y, °'),
+        ('stale_time', 'Порог устаревания, с'),
+        ('radial_depth', 'SDK выдаёт дальность по лучу'),
+        ('compensate', 'Компенсация командных углов')],
+    'Приводы': [
+        ('x_min', 'X минимум, ° · D9'), ('x_max', 'X максимум, °'),
+        ('y_min', 'Y минимум, ° · D10'), ('y_max', 'Y максимум, °'),
+        ('invert_x', 'Инверсия X'), ('invert_y', 'Инверсия Y'),
+        ('gain', 'Коэффициент P, 1/с'), ('deadband', 'Мёртвая зона, °'),
+        ('max_speed', 'Макс. скорость, °/с'), ('max_acceleration', 'Макс. ускорение, °/с²'),
+        ('manual_step', 'Шаг ручного режима, °')],
+    'Связь': [
+        ('port', 'Arduino: AUTO или порт'), ('connection', 'Подключение камеры'),
+        ('camera_index', 'Индекс камеры'), ('sdk_range', 'Режим SDK, мм'),
+        ('quality', 'Источник качества')],
+}
+
+HELP = """ПОРЯДОК НАСТРОЙКИ
+1. Проверьте механические пределы и питание. Arduino: StandardFirmata.
+2. Нажмите «Запуск». Начальный режим — ручной, центр — 90° / 90°.
+3. Проверьте направления кнопками; при необходимости измените инверсию.
+4. Задайте дальность, площадь, угол обзора камеры. Нажмите «Применить».
+5. Включите «Авто». Зеленая рамка — выбранный объект; голубой ромб — прогноз.
+
+ПЛОЩАДЬ И ДАЛЬНОСТЬ
+Проекция в м² ≈ сумма Z²/(fx·fy) по пикселям компоненты.
+Это оценка видимой площади поперёк оптической оси, а не площадь поверхности.
+Она зависит от калибровки FOV, ракурса и перекрытия объекта.
+Дальность отбора пикселей — величина SDK (обычно Z). В телеметрии —
+евклидово расстояние до оценённого центра объекта.
+Объекты с соприкасающимися контурами и похожей глубиной могут сливаться.
+«Связность» задаёт допустимый локальный перепад между соседними пикселями.
+
+УСТОЙЧИВОСТЬ И ПРОГНОЗ
+Объект подтверждается N последовательными наблюдениями.
+Выбирается ближайший подтверждённый объект. Для смены нужны отрыв
+по расстоянию и несколько кадров подряд. При краткой потере идентификатор
+сохраняется, движение в авто останавливается. Затем выполняется новый поиск.
+Kalman XYZ+VXYZ учитывает реальное dt. Горизонт = N×период кадров +
+дополнительная задержка + время обработки, с ограничением в секундах.
+Период измеряется по полученным/обработанным кадрам, не по паспортному FPS.
+Прогноз при слишком большой неопределённости не управляет приводами.
+Параметры шума измерения/ускорения требуют настройки по реальным данным.
+
+ТЕЛЕМЕТРИЯ
+Система координат: X вправо, Y вниз, Z вперёд от нейтрального положения.
+Скорость приближения отрицательна, удаления положительна.
+Углы — команды, а не показания датчиков. Компенсация вращения приближённая:
+люфт, задержка, наклон осей и поступательное движение основания неизвестны.
+Без энкодеров/IMU это не абсолютная скорость объекта и не навигационное решение.
+Нет высоты, географических координат или синхронизации с авиационной шиной.
+CSV содержит UTC компьютера и монотонное время получения кадров.
+
+УПРАВЛЕНИЕ И ОШИБКИ
+Ручные стрелки задают шаг направления изображения с учётом инверсии.
+Escape / «СТОП» отменяет дальнейшие команды; сервоприводы остаются запитаны
+и могут закончить уже полученное движение. Это не аппаратная аварийная кнопка.
+«Продолжить вручную» снимает блокировку. «Отключить» освобождает ресурсы;
+StandardFirmata снимает управляющие импульсы при закрытии соединения.
+При неоднозначном AUTO выберите порт вручную. Повторное подключение
+возвращает 90/90; автоматический режим надо включать самостоятельно.
+Параметры подключения камеры/качества меняются после «Отключить».
+
+ДЕМОНСТРАЦИЯ
+--demo не обращается к камере и Arduino. Два синтетических объекта,
+шум глубины и геометрическая реакция изображения на команды подвеса.
+Это проверка логики и интерфейса, а не модель механики сервоприводов.
+"""
+
+
+class App:
+    def __init__(self, args):
+        import tkinter as tk
+        from tkinter import ttk, messagebox, filedialog
+        from PIL import Image, ImageTk
+        self.tk, self.ttk, self.messagebox, self.filedialog = tk, ttk, messagebox, filedialog
+        self.Image, self.ImageTk = Image, ImageTk
+        self.root = tk.Tk()
+        self.root.title('ToF Gimbal Tracker · камера глубины')
+        self.root.geometry('1280x850')
+        self.root.minsize(1000, 720)
+        self.root.configure(bg='#101823')
+        self.args, self.worker, self.closing = args, None, False
+        cfg = Settings()
+        if args.config:
+            cfg = self.read_config(args.config)
+        self.shared = Shared(cfg)
+        self.photo = None
+        self.csv_active = False
+        self.variables = {}
+        self.style()
+        top = ttk.Frame(self.root, padding=(20, 16))
+        top.pack(fill='x')
+        ttk.Label(top, text='ToF / GIMBAL', style='Title.TLabel').pack(side='left')
+        ttk.Label(top, text='  ГЛУБИНА · СОПРОВОЖДЕНИЕ · ПРОГНОЗ', style='Muted.TLabel').pack(side='left', padx=12)
+        self.badge = ttk.Label(top, text='ДЕМОНСТРАЦИЯ' if args.demo else 'Raspberry Pi 5  →  Arduino Uno', style='Accent.TLabel')
+        self.badge.pack(side='right')
+        toolbar = ttk.Frame(self.root, padding=(20, 0, 20, 12))
+        toolbar.pack(fill='x')
+        self.start_button = ttk.Button(toolbar, text='Запуск', command=self.start, style='Accent.TButton')
+        self.start_button.pack(side='left', padx=(0, 6))
+        ttk.Button(toolbar, text='Отключить', command=self.disconnect).pack(side='left', padx=6)
+        self.mode = tk.StringVar(value='manual')
+        for value, title in [('manual', 'Ручной'), ('auto', 'Авто')]:
+            ttk.Radiobutton(toolbar, text=title, value=value, variable=self.mode, command=self.change_mode).pack(side='left', padx=8)
+        ttk.Button(toolbar, text='СТОП  [Esc]', style='Stop.TButton', command=self.emergency).pack(side='right')
+        ttk.Button(toolbar, text='Продолжить вручную', command=self.resume).pack(side='right', padx=8)
+        body = ttk.Panedwindow(self.root, orient='horizontal')
+        body.pack(fill='both', expand=True, padx=20)
+        left = ttk.Frame(body)
+        right = ttk.Frame(body, width=430)
+        body.add(left, weight=3)
+        body.add(right, weight=2)
+        self.status = tk.StringVar(value='ГОТОВО К ЗАПУСКУ • ручной режим')
+        ttk.Label(left, textvariable=self.status, style='Accent.TLabel', wraplength=650).pack(anchor='w', pady=(0, 8))
+        self.video = tk.Canvas(left, bg='#0a1019', highlightthickness=1, highlightbackground='#26384b', height=340)
+        self.video.pack(fill='both', expand=True, padx=(0, 12))
+        self.video.create_text(300, 160, text='Карта глубины появится после запуска', fill='#8293a7', font=('Helvetica', 13), tags='placeholder')
+        ttk.Label(left, text='Ближе: красный  →  жёлтый  →  синий: дальше   |   тёмный: нет данных', style='Muted.TLabel').pack(anchor='w', pady=8)
+        cards = ttk.Frame(left)
+        cards.pack(fill='x', pady=8)
+        self.metrics = {}
+        for i, (key, label) in enumerate([('range', 'ДАЛЬНОСТЬ'), ('speed', 'СКОРОСТЬ*'), ('radial', 'УДАЛЕНИЕ / СБЛИЖЕНИЕ'), ('area', 'ПРОЕКЦИЯ')]):
+            box = ttk.Frame(cards, padding=9, style='Card.TFrame')
+            box.grid(row=i // 2, column=i % 2, sticky='nsew', padx=(0, 8), pady=(0, 8))
+            cards.columnconfigure(i % 2, weight=1)
+            ttk.Label(box, text=label, style='CardCaption.TLabel').pack(anchor='w')
+            var = tk.StringVar(value='—')
+            self.metrics[key] = var
+            ttk.Label(box, textvariable=var, style='CardValue.TLabel').pack(anchor='w')
+        self.detail = tk.StringVar(value='X 90°  /  Y 90° · команды, без обратной связи')
+        ttk.Label(left, textvariable=self.detail, wraplength=640, style='Muted.TLabel').pack(anchor='w', pady=5)
+        ttk.Label(left, text='* Оценка относительно основания; компенсация поворота по командам.', style='Muted.TLabel', wraplength=640).pack(anchor='w')
+        manual = ttk.Frame(left, padding=(0, 12))
+        manual.pack(fill='x')
+        for text, vector in [('← Влево', (-1, 0)), ('↑ Вверх', (0, -1)), ('↓ Вниз', (0, 1)), ('Вправо →', (1, 0))]:
+            ttk.Button(manual, text=text, command=lambda v=vector: self.manual(v)).pack(side='left', padx=(0, 4))
+        ttk.Button(manual, text='Центр 90/90', command=lambda: self.manual(None)).pack(side='left', padx=4)
+        notebook = ttk.Notebook(right)
+        notebook.pack(fill='both', expand=True)
+        for name, fields in GROUPS.items():
+            tab = ttk.Frame(notebook, padding=12)
+            notebook.add(tab, text=name)
+            tab.columnconfigure(0, weight=1)
+            for row, (key, label) in enumerate(fields):
+                default = getattr(cfg, key)
+                if isinstance(default, bool):
+                    var = tk.BooleanVar(value=default)
+                    ttk.Checkbutton(tab, text=label, variable=var).grid(row=row, column=0, columnspan=2, sticky='w', pady=7)
+                else:
+                    var = tk.StringVar(value=str(default))
+                    ttk.Label(tab, text=label).grid(row=row, column=0, sticky='w', pady=6)
+                    options = {'quality': ['auto', 'confidence', 'amplitude', 'off'],
+                               'connection': ['CSI', 'USB'], 'sdk_range': ['2000', '4000']}
+                    if key in options:
+                        widget = ttk.Combobox(tab, textvariable=var, values=options[key], state='readonly', width=13)
+                    else:
+                        widget = ttk.Entry(tab, textvariable=var, width=14)
+                    widget.grid(row=row, column=1, sticky='e', padx=(8, 0), pady=6)
+                self.variables[key] = var
+            if name == 'Связь':
+                ttk.Button(tab, text='Показать доступные порты', command=self.ports).grid(row=6, column=0, columnspan=2, sticky='ew', pady=8)
+                ttk.Button(tab, text='Переподключить Arduino', command=lambda: self.action('connect', None)).grid(row=7, column=0, columnspan=2, sticky='ew', pady=8)
+                ttk.Label(tab, text='AUTO выбирает единственный USB-кандидат и проверяет Firmata.\n\nИзменения полей вступают в силу после «Применить».\n\nПовторное подключение центрирует подвес.\n\nFOV 60°/45° — начальная оценка: укажите углы обзора своей модели камеры.', wraplength=345, style='Muted.TLabel').grid(row=8, column=0, columnspan=2, sticky='w', pady=12)
+        help_tab = ttk.Frame(notebook)
+        notebook.add(help_tab, text='Помощь')
+        help_text = tk.Text(help_tab, wrap='word', bg='#172333', fg='#dce6f1', relief='flat', font=('Helvetica', 11), padx=12, pady=12, width=38)
+        help_scroll = ttk.Scrollbar(help_tab, command=help_text.yview)
+        help_scroll.pack(side='right', fill='y')
+        help_text.configure(yscrollcommand=help_scroll.set)
+        help_text.pack(fill='both', expand=True)
+        help_text.insert('1.0', HELP)
+        help_text.configure(state='disabled')
+        settings_bar = ttk.Frame(right, padding=(0, 12))
+        settings_bar.pack(fill='x')
+        ttk.Button(settings_bar, text='Применить', style='Accent.TButton', command=self.apply).pack(side='left')
+        ttk.Button(settings_bar, text='Сохранить', command=self.save).pack(side='left', padx=6)
+        ttk.Button(settings_bar, text='Загрузить', command=self.load).pack(side='left')
+        footer = ttk.Frame(self.root, padding=(20, 8, 20, 16))
+        footer.pack(fill='x')
+        self.log_line = tk.StringVar(value='Измените настройки и нажмите «Применить». Подробности — во вкладке «Помощь».')
+        ttk.Label(footer, textvariable=self.log_line, wraplength=920, style='Muted.TLabel').pack(side='left', fill='x', expand=True)
+        self.csv_button = ttk.Button(footer, text='Запись CSV', command=self.toggle_csv)
+        self.csv_button.pack(side='right')
+        self.root.bind('<Escape>', lambda event: self.emergency())
+        self.root.protocol('WM_DELETE_WINDOW', self.close)
+        self.root.after(40, self.poll)
+
+    def style(self):
+        style = self.ttk.Style(self.root)
+        style.theme_use('clam')
+        style.configure('.', background='#101823', foreground='#dce6f1', font=('Helvetica', 11))
+        style.configure('TFrame', background='#101823')
+        style.configure('TLabel', background='#101823')
+        style.configure('Title.TLabel', font=('Helvetica', 22, 'bold'), foreground='#f4f8fc')
+        style.configure('Muted.TLabel', foreground='#94a8bd', font=('Helvetica', 10))
+        style.configure('Accent.TLabel', foreground='#57d8cc', font=('Helvetica', 11, 'bold'))
+        style.configure('TButton', background='#24364a', padding=(10, 8), borderwidth=0)
+        style.map('TButton', background=[('active', '#36506b'), ('disabled', '#1b2735')])
+        style.configure('Accent.TButton', background='#17665f', foreground='#ffffff')
+        style.map('Accent.TButton', background=[('active', '#20897f')])
+        style.configure('Stop.TButton', background='#923e4c', foreground='white')
+        style.map('Stop.TButton', background=[('active', '#b64e60')])
+        style.configure('TEntry', fieldbackground='#1b293a', foreground='#f2f6fa', insertcolor='white')
+        style.configure('TCombobox', fieldbackground='#1b293a', foreground='#f2f6fa', arrowcolor='#57d8cc')
+        style.map('TCombobox', fieldbackground=[('readonly', '#1b293a')], foreground=[('readonly', '#f2f6fa')])
+        style.configure('TNotebook', borderwidth=0)
+        style.configure('TNotebook.Tab', background='#1b293a', padding=(8, 8))
+        style.map('TNotebook.Tab', background=[('selected', '#264252')], foreground=[('selected', '#65e1d4')])
+        style.configure('TCheckbutton', background='#101823')
+        style.configure('TRadiobutton', background='#101823')
+        style.configure('Card.TFrame', background='#1a2839')
+        style.configure('CardCaption.TLabel', background='#1a2839', foreground='#95a9bf', font=('Helvetica', 9))
+        style.configure('CardValue.TLabel', background='#1a2839', foreground='#eef6ff', font=('Helvetica', 20, 'bold'))
+
+    @staticmethod
+    def read_config(path):
+        with open(path, encoding='utf-8') as stream:
+            data = json.load(stream)
+        if not isinstance(data, dict):
+            raise ValueError('Настройки должны быть JSON-объектом')
+        if set(data) - set(asdict(Settings())):
+            raise ValueError('Неизвестные поля в настройках')
+        return Settings(**data).validate()
+
+    def collect(self):
+        values = {}
+        for key, default in asdict(Settings()).items():
+            raw = self.variables[key].get()
+            try:
+                values[key] = raw if isinstance(default, bool) else type(default)(str(raw).strip().replace(',', '.') if not isinstance(default, str) else str(raw).strip())
+            except (TypeError, ValueError):
+                raise ValueError(f'{key}: некорректное значение {raw!r}') from None
+        return Settings(**values).validate()
+
+    def apply(self):
+        try:
+            cfg = self.collect()
+            old, _, _, _ = self.shared.snapshot()
+            if self.worker and self.worker.is_alive():
+                for key in ('connection', 'camera_index', 'sdk_range', 'quality'):
+                    if getattr(cfg, key) != getattr(old, key):
+                        raise ValueError('Сначала нажмите «Отключить» для изменения подключения камеры или источника качества')
+            with self.shared.lock:
+                self.shared.cfg = cfg
+                self.shared.revision += 1
+            self.log_line.set('Настройки применены; объекты будут подтверждены заново.')
+            return True
+        except ValueError as exc:
+            self.messagebox.showerror('Проверьте настройки', str(exc))
+            return False
+
+    def start(self):
+        if self.worker and self.worker.is_alive():
+            return
+        if not self.apply():
+            return
+        cfg, _, _, _ = self.shared.snapshot()
+        self.shared = Shared(cfg)
+        self.mode.set('manual')
+        self.csv_active = False
+        self.csv_button.configure(text='Запись CSV')
+        self.worker = Worker(self.shared, self.args.demo)
         self.worker.start()
-        self.status_var.set("STARTING")
-        self.error_var.set("")
-        self._update_manual_controls_state()
+        self.start_button.configure(state='disabled')
+        self.status.set('ПОДКЛЮЧЕНИЕ • Arduino может перезагружаться несколько секунд')
 
-    def stop_system(self) -> None:
-        self.shared.clear_manual_input()
-        self._pressed_manual_keys.clear()
-        if self.worker is not None and self.worker.is_alive():
-            self.worker.stop()
-            self.status_var.set("STOPPING")
+    def disconnect(self):
+        self.shared.emergency.set()
+        self.shared.stop.set()
+        self.mode.set('manual')
+        with self.shared.lock:
+            self.shared.mode = 'manual'
+        self.status.set('ОТКЛЮЧЕНИЕ • освобождение камеры и Arduino')
 
-    def _ui_tick(self) -> None:
-        image_bgr, t = self.shared.snapshot()
-        self.status_var.set(t.state)
-        self.error_var.set(t.error)
-        self._update_manual_controls_state()
+    def action(self, key, value):
+        if not self.worker or not self.worker.is_alive() or self.shared.stop.is_set():
+            self.log_line.set('Сначала запустите подключение.')
+            return
+        if key == 'connect':
+            self.mode.set('manual')
+            self.change_mode()
+        try:
+            self.shared.actions.put_nowait((key, value))
+        except queue.Full:
+            self.log_line.set('Очередь команд заполнена; дождитесь выполнения.')
 
-        approach = "приближается" if t.vz_m_s < -0.03 else ("удаляется" if t.vz_m_s > 0.03 else "стабильно по Z")
-        self.telemetry_var.set(
-            f"seq={t.seq}  FPS={t.fps:.1f}  state={t.state}  mode={t.control_mode}  valid={int(t.target_valid)}\n"
-            f"XYZ(image/depth): x={t.x_px:.1f}px  y={t.y_px:.1f}px  z={t.z_m:.3f}m\n"
-            f"V: vx={t.vx_px_s:+.1f}px/s  vy={t.vy_px_s:+.1f}px/s  vz={t.vz_m_s:+.3f}m/s ({approach})\n"
-            f"Prediction: +{t.horizon_s:.3f}s -> ({t.pred_x_px:.1f}px, {t.pred_y_px:.1f}px, {t.pred_z_m:.3f}m)\n"
-            f"Servo: X={t.servo_x_deg:.1f}°  Y={t.servo_y_deg:.1f}°  "
-            f"manual=({t.manual_x:+d},{t.manual_y:+d})  stable={t.stable_count}  lost={t.lost_count}"
-        )
+    def manual(self, vector):
+        if self.mode.get() != 'manual' or self.shared.emergency.is_set():
+            self.log_line.set('Ручное движение доступно в ручном режиме после снятия СТОП.')
+            return
+        self.action('center' if vector is None else 'step', vector)
 
-        if image_bgr is not None:
-            rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-            pil = Image.fromarray(rgb)
+    def change_mode(self):
+        if self.shared.emergency.is_set():
+            self.mode.set('manual')
+        with self.shared.lock:
+            self.shared.mode = self.mode.get()
 
-            # Fit into a large preview without changing tracking coordinates.
-            max_w = max(480, self.video_label.winfo_width() - 8)
-            max_h = max(360, self.video_label.winfo_height() - 8)
-            if pil.width > 0 and pil.height > 0:
-                scale = min(max_w / pil.width, max_h / pil.height)
-                scale = max(1.0, scale)
-                new_size = (int(pil.width * scale), int(pil.height * scale))
-                pil = pil.resize(new_size, Image.Resampling.NEAREST)
+    def emergency(self):
+        self.shared.emergency.set()
+        self.mode.set('manual')
+        with self.shared.lock:
+            self.shared.mode = 'manual'
+        self.status.set('СТОП • дальнейшие команды заблокированы')
 
-            self.tk_image = ImageTk.PhotoImage(pil)
-            self.video_label.configure(image=self.tk_image)
+    def resume(self):
+        if self.shared.stop.is_set():
+            self.log_line.set('Дождитесь отключения, затем нажмите «Запуск».')
+            return
+        # Purge old directional actions before clearing the stop latch.
+        retained = []
+        while True:
+            try:
+                item = self.shared.actions.get_nowait()
+                if item[0] not in ('step', 'center'):
+                    retained.append(item)
+            except queue.Empty:
+                break
+        for item in retained:
+            self.shared.actions.put_nowait(item)
+        self.mode.set('manual')
+        with self.shared.lock:
+            self.shared.mode = 'manual'
+        self.shared.emergency.clear()
+        self.log_line.set('Блокировка снята. Ручной режим.')
 
-        if self.worker is not None and not self.worker.is_alive() and t.state == "STOPPING":
-            self.status_var.set("STOPPED")
+    def save(self):
+        try:
+            cfg = self.collect()
+            path = self.filedialog.asksaveasfilename(title='Сохранить настройки', defaultextension='.json', initialfile='tof_settings.json', filetypes=[('JSON', '*.json')])
+            if path:
+                target = Path(path)
+                temporary = target.with_suffix(target.suffix + '.tmp')
+                temporary.write_text(json.dumps(asdict(cfg), ensure_ascii=False, indent=2), encoding='utf-8')
+                temporary.replace(target)
+                self.log_line.set(f'Настройки сохранены: {path}')
+        except (OSError, ValueError) as exc:
+            self.messagebox.showerror('Сохранение', str(exc))
 
-        self.root.after(50, self._ui_tick)
+    def load(self):
+        path = self.filedialog.askopenfilename(title='Настройки', filetypes=[('JSON', '*.json')])
+        if not path:
+            return
+        try:
+            cfg = self.read_config(path)
+            for key, value in asdict(cfg).items():
+                self.variables[key].set(value)
+            self.log_line.set('Настройки загружены в поля. Нажмите «Применить».')
+        except (OSError, ValueError, TypeError) as exc:
+            self.messagebox.showerror('Загрузка', str(exc))
 
-    def on_close(self) -> None:
-        self.shared.clear_manual_input()
-        self._pressed_manual_keys.clear()
-        if self.worker is not None and self.worker.is_alive():
-            self.worker.stop()
-        self.root.destroy()
+    def ports(self):
+        try:
+            from serial.tools import list_ports
+            ports = list(list_ports.comports())
+            self.messagebox.showinfo('Последовательные порты', '\n'.join(f'{p.device} — {p.description}' for p in ports) or 'Порты не найдены')
+        except ImportError:
+            self.messagebox.showerror('Зависимости', 'Установите pyserial: python3 -m pip install pyserial')
+
+    def toggle_csv(self):
+        if not self.worker or not self.worker.is_alive():
+            self.log_line.set('Запись доступна после запуска.')
+            return
+        if self.csv_active:
+            self.action('csv', None)
+        else:
+            path = self.filedialog.asksaveasfilename(title='Запись телеметрии', defaultextension='.csv', initialfile='tof_telemetry.csv', filetypes=[('CSV', '*.csv')])
+            if not path:
+                return
+            self.action('csv', path)
+
+    def poll(self):
+        with self.shared.lock:
+            self.shared.heartbeat = time.monotonic()
+        if self.worker and not self.worker.is_alive():
+            self.start_button.configure(state='normal')
+            self.csv_active = False
+            self.csv_button.configure(text='Запись CSV')
+        while True:
+            try:
+                message = self.shared.events.get_nowait()
+                self.log_line.set(message)
+                if message == 'Запись CSV включена':
+                    self.csv_active = True
+                    self.csv_button.configure(text='Остановить CSV')
+                elif message.startswith(('CSV:', 'Запись CSV выключена', 'Запись CSV остановлена')):
+                    self.csv_active = False
+                    self.csv_button.configure(text='Запись CSV')
+            except queue.Empty:
+                break
+        try:
+            image, data = self.shared.frames.get_nowait()
+        except queue.Empty:
+            image, data = None, None
+        if data:
+            self.status.set(data['state'])
+            for key, units, digits in [('range', 'м', 2), ('speed', 'м/с', 2), ('radial', 'м/с', 2), ('area', 'м²', 4)]:
+                value = data.get(key)
+                self.metrics[key].set(f'{value:+.{digits}f} {units}' if key == 'radial' and value is not None else f'{value:.{digits}f} {units}' if value is not None else '—')
+            x, y = data['angles']
+            detail = f"X {x:.1f}° / Y {y:.1f}° · {data['port']}"
+            if 'fps' in data:
+                sigma = '—' if data['sigma'] is None else f"{data['sigma']:.3f} м"
+                detail += f"\n{data['fps']:.1f} FPS · обработка {data['age']*1000:.0f} мс · прогноз {data['horizon']:.3f} с · σ {sigma}"
+                detail += f"\nОбъектов: {data['count']} · качество: {data['quality']}"
+                if data['capped']:
+                    detail += ' · лимит компонент: увеличьте фильтрацию'
+            self.detail.set(detail)
+            if image is None:
+                self.video.delete('all')
+                self.video.create_text(max(1, self.video.winfo_width()) // 2, max(1, self.video.winfo_height()) // 2,
+                    text='НЕТ АКТУАЛЬНОГО ИЗОБРАЖЕНИЯ', fill='#c4a3a8', font=('Helvetica', 14))
+        if image is not None:
+            picture = self.Image.fromarray(image)
+            scale = min(max(1, self.video.winfo_width() - 4) / picture.width,
+                        max(1, self.video.winfo_height() - 4) / picture.height)
+            picture = picture.resize((max(1, round(picture.width * scale)),
+                                      max(1, round(picture.height * scale))), self.Image.Resampling.NEAREST)
+            self.photo = self.ImageTk.PhotoImage(picture)
+            self.video.delete('all')
+            self.video.create_image(self.video.winfo_width() // 2, self.video.winfo_height() // 2, image=self.photo)
+        if self.closing and (not self.worker or not self.worker.is_alive()):
+            self.root.destroy()
+            return
+        self.root.after(40, self.poll)
+
+    def close(self):
+        self.closing = True
+        self.disconnect()
+        self.log_line.set('Завершение: ожидается возврат SDK и закрытие устройств…')
+
+    def run(self):
+        self.root.mainloop()
 
 
-def main() -> None:
-    root = tk.Tk()
-    TrackerApp(root)
-    root.mainloop()
+def self_test():
+    """Deterministic regression checks; require numpy/OpenCV, not Tk/hardware."""
+    import unittest
+
+    class Tests(unittest.TestCase):
+        def setUp(self):
+            self.cfg = replace(Settings(), area_min=.0001, area_max=1., confirm=3)
+
+        def detection(self, z=1., x=0., area=.01):
+            return Detection(np.array([x, 0., z]), area, 100, (10, 10, 10, 10), (15, 15), math.hypot(x, z))
+
+        def test_validation(self):
+            Settings().validate()
+            for bad in [dict(near=5), dict(x_min=100), dict(horizon_frames=-1),
+                        dict(fov_x=float('nan')), dict(confirm=2.5), dict(invert_x=1), dict(area_min=2)]:
+                with self.assertRaises(ValueError):
+                    replace(Settings(), **bad).validate()
+
+        def test_invalid_depth_quality_and_size(self):
+            d = np.full((100, 100), np.nan, np.float32)
+            d[20:40, 20:40] = 1
+            d[60:85, 60:85] = 2
+            quality = np.full_like(d, 100)
+            quality[60:85, 60:85] = 0
+            found, _, _ = detect(d, quality, self.cfg)
+            self.assertEqual(len(found), 1)
+            self.assertAlmostEqual(found[0].point[2], 1)
+            found, _, _ = detect(d, quality, replace(self.cfg, area_min=.5))
+            self.assertFalse(found)
+
+        def test_depth_adjacency(self):
+            d = np.full((100, 100), np.nan, np.float32)
+            d[20:60, 20:40], d[20:60, 40:60] = 1., 2.
+            found, _, _ = detect(d, None, self.cfg)
+            self.assertEqual(len(found), 2)
+
+        def test_area_scales_with_distance_squared(self):
+            d = np.full((100, 100), np.nan, np.float32)
+            d[30:50, 30:50] = 1
+            a = detect(d, None, self.cfg)[0][0].area
+            d[30:50, 30:50] = 2
+            b = detect(d, None, self.cfg)[0][0].area
+            self.assertAlmostEqual(b / a, 4)
+
+        def test_nearest_stable_and_occlusion(self):
+            tracker = Tracker()
+            for n in range(3):
+                target = tracker.update([self.detection(1), self.detection(2)], n * .04, np.eye(3), self.cfg)
+                if n < 2:
+                    self.assertIsNone(target)
+            self.assertAlmostEqual(target.detection.distance, 1.)
+            identity = target.id
+            target = tracker.update([], .16, np.eye(3), self.cfg)
+            self.assertFalse(target.visible)
+            target = tracker.update([self.detection(1)], .20, np.eye(3), self.cfg)
+            self.assertEqual(identity, target.id)
+            self.assertIsNone(tracker.update([], 1., np.eye(3), self.cfg))
+
+        def test_switch_hysteresis(self):
+            cfg = replace(self.cfg, confirm=1, switch_frames=3)
+            tr = Tracker()
+            original = tr.update([self.detection(2)], 0, np.eye(3), cfg).id
+            for n in (1, 2):
+                t = tr.update([self.detection(2), self.detection(1)], n * .04, np.eye(3), cfg)
+                self.assertEqual(t.id, original)
+            t = tr.update([self.detection(2), self.detection(1)], .12, np.eye(3), cfg)
+            self.assertNotEqual(t.id, original)
+
+        def test_velocity_and_approach_prediction(self):
+            k = Filter(np.array([0., 0., 2.]), self.cfg)
+            for i in range(1, 101):
+                k.predict(.02, self.cfg)
+                k.correct(np.array([.1 * i * .02, 0., 2 - .2 * i * .02]), self.cfg)
+            np.testing.assert_allclose(k.x[3:], [.1, 0., -.2], atol=.015)
+            point, sigma = k.future(.3, self.cfg)
+            self.assertLess(point[2], k.x[2])
+            self.assertGreater(sigma, 0)
+            self.assertTrue(np.all(np.linalg.eigvalsh(k.P) >= -1e-9))
+
+        def test_rotation_reprojection(self):
+            for inv in (False, True):
+                cfg = replace(self.cfg, invert_x=inv)
+                R = rotation([120, 105], cfg)
+                np.testing.assert_allclose(R.T @ R, np.eye(3), atol=1e-12)
+                p = np.array([.1, .2, 1.])
+                np.testing.assert_allclose(R.T @ (R @ p), p, atol=1e-12)
+
+        def test_stationary_object_rotating_camera(self):
+            tr = Tracker()
+            base = np.array([.1, .1, 2.])
+            for i in range(60):
+                R = rotation([90 + i * .2, 90], self.cfg)
+                d = self.detection()
+                d.point = R.T @ base
+                t = tr.update([d], i * .04, R, self.cfg)
+            np.testing.assert_allclose(t.kf.x[3:], np.zeros(3), atol=1e-8)
+
+        def test_servo_limits_speed_acceleration(self):
+            g = Gimbal(True)
+            previous = g.angles.copy()
+            previous_v = g.velocity.copy()
+            for _ in range(200):
+                g.move([500, -500], .02, self.cfg)
+                self.assertTrue(np.all(abs(g.angles - previous) <= self.cfg.max_speed * .02 + 1e-8))
+                self.assertTrue(np.all(abs(g.velocity - previous_v) <= self.cfg.max_acceleration * .02 + 1e-8))
+                previous, previous_v = g.angles.copy(), g.velocity.copy()
+            self.assertLessEqual(g.angles[0], 160)
+            self.assertGreaterEqual(g.angles[1], 45)
+            g.hold()
+            np.testing.assert_equal(g.velocity, [0, 0])
+
+        def test_demo_pipeline(self):
+            camera = Camera(self.cfg, True)
+            packet = camera.read([90, 90], self.cfg)
+            depth, quality, timestamp, _ = packet
+            detections, valid, _ = detect(depth, quality, self.cfg)
+            self.assertGreaterEqual(len(detections), 1)
+            image = Worker.render(depth, valid, detections, None, None, self.cfg)
+            self.assertEqual(image.shape, (180, 240, 3))
+
+        def test_sdk_buffer_copy_and_release(self):
+            from types import SimpleNamespace
+            class Frame:
+                depth_data = np.full((4, 5), 1500., np.float32)
+                confidence_data = np.full((4, 5), 100., np.float32)
+            frame = Frame()
+            released = []
+            def release(item):
+                released.append(item)
+                item.depth_data[:] = -1
+                item.confidence_data[:] = -1
+            camera = Camera.__new__(Camera)
+            camera.demo = False
+            camera.quality_name = 'confidence'
+            camera.ac = SimpleNamespace(DepthData=Frame)
+            camera.cam = SimpleNamespace(requestFrame=lambda timeout: frame, releaseFrame=release)
+            depth, quality, _, _ = camera.read([90, 90], self.cfg)
+            self.assertEqual(len(released), 1)
+            np.testing.assert_allclose(depth, 1.5)
+            np.testing.assert_allclose(quality, 100)
+
+        def test_sdk_bad_frame_released(self):
+            from types import SimpleNamespace
+            class Frame:
+                depth_data = np.ones((4, 5), np.float32)
+            frame = Frame()
+            released = []
+            camera = Camera.__new__(Camera)
+            camera.demo = False
+            camera.quality_name = 'confidence'
+            camera.ac = SimpleNamespace(DepthData=Frame)
+            camera.cam = SimpleNamespace(requestFrame=lambda timeout: frame,
+                                         releaseFrame=lambda item: released.append(item))
+            with self.assertRaises(RuntimeError):
+                camera.read([90, 90], self.cfg)
+            self.assertEqual(len(released), 1)
+
+        def test_outlier_not_associated(self):
+            tracker = Tracker()
+            cfg = replace(self.cfg, confirm=1)
+            original = tracker.update([self.detection(1)], 0, np.eye(3), cfg).id
+            selected = tracker.update([self.detection(3)], .04, np.eye(3), cfg)
+            self.assertEqual(selected.id, original)
+            self.assertFalse(selected.visible)
+            self.assertEqual(len(tracker.tracks), 2)
+
+        def test_newest_frame_queue(self):
+            shared = Shared(self.cfg)
+            shared.publish((1, {}))
+            shared.publish((2, {}))
+            self.assertEqual(shared.frames.get_nowait()[0], 2)
+            self.assertTrue(shared.frames.empty())
+
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(Tests)
+    return unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful()
 
 
-if __name__ == "__main__":
-    main()
+def main():
+    parser = argparse.ArgumentParser(description='Arducam ToF camera gimbal · Raspberry Pi 5 + Arduino Uno')
+    parser.add_argument('--demo', action='store_true', help='синтетическая камера и виртуальные сервоприводы')
+    parser.add_argument('--self-test', action='store_true', help='проверка алгоритмов без оборудования и дисплея')
+    parser.add_argument('--config', type=Path, help='JSON с настройками')
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    if args.self_test:
+        return 0 if self_test() else 1
+    try:
+        App(args).run()
+    except (ImportError, ValueError, OSError) as exc:
+        LOG.error('%s', exc)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
