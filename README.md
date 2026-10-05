@@ -154,3 +154,63 @@ rpicam-hello
 rpicam-hello --list-cameras
 ```
 
+# Создание службы
+
+```
+sudo nano /etc/systemd/system/task.service
+```
+
+```
+[Unit]
+Description=Python application
+After=multi-user.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/Documents/pvo
+Environment="PATH=/home/pi/Documents/pvo/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/pi/Documents/pvo/.venv/bin/python -u /home/pi/Documents/pvo/clue/time-of-flight.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## Проверка служб вручную
+
+```
+sudo systemctl daemon-reload
+sudo systemctl start task.service
+sudo systemctl status task.service --no-pager -l
+```
+
+## Посмотреть последние сообщения
+
+```
+sudo journalctl -u task.service -n 100 --no-pager
+```
+
+## Наблюдать за сообщениями в реальном времени
+
+```
+sudo journalctl -u task.service -f
+```
+
+## Включить автозапуск и проверить перезагрузку
+```
+sudo systemctl enable task.service
+sudo reboot
+```
+
+## После загрузки подключиться к Raspberry Pi и проверить
+
+```
+systemctl is-enabled task.service
+sudo systemctl status task.service --no-pager -l
+sudo journalctl -u task.service -b --no-pager
+```
