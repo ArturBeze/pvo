@@ -1,9 +1,0 @@
-# Основные зависимости
-opencv-python
-#opencv-contrib-python
-numpy
-#numpy<2.0.0
-pillow
-
-# Time of Flight Camera
-ArducamDepthCamera
