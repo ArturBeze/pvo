@@ -1,5 +1,0 @@
-numpy
-opencv-python
-Pillow
-# Install ArducamDepthCamera separately on the Raspberry Pi using vendor instructions.
-# pyFirmata2 will be used when Arduino control is added.
