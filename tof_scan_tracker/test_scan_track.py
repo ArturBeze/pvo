@@ -1,4 +1,4 @@
-"""python -m unittest discover -s tof_opencv -p test_scan_track.py -v"""
+"""python -m unittest discover -s tof_scan_tracker -p test_scan_track.py -v"""
 import unittest
 from unittest.mock import patch
 from types import SimpleNamespace

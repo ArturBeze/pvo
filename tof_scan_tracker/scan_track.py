@@ -1,6 +1,6 @@
 """ToF + Arduino Uno: сканирование змейкой и слежение за фрагментом.
 
-python tof_opencv/scan_track.py --port /dev/ttyACM0 --min 400 --max 500
+python tof_scan_tracker/scan_track.py --port /dev/ttyACM0 --min 400 --max 500
 Выход: Q / Esc. Требуется StandardFirmata и pyFirmata2.
 """
 import argparse
@@ -10,7 +10,7 @@ from time import monotonic
 
 import cv2
 import numpy as np
-from view_camera import valid_mask, render_depth, annotate_fragment
+from image_utils import valid_mask, render_depth, annotate_fragment
 
 
 def parse_args(argv=None):
@@ -86,7 +86,7 @@ def resolve_port(port='auto', ports=None):
 
 
 def find_fragments(depth, confidence, args):
-    """Те же компоненты по глубине, что в view_camera, плюс центры для слежения."""
+    """Связные компоненты по глубине и их центры для слежения."""
     valid = valid_mask(depth, confidence, args.confidence, args.min, args.max)
     if not valid.any():
         return []

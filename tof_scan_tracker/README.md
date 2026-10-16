@@ -1,8 +1,8 @@
 # Сканирование и слежение
 
-`scan_track.py` — новый скрипт OpenCV + pyFirmata2. Старый `view_camera.py`
-остаётся обычным просмотрщиком; держите его рядом: новый скрипт использует его
-функции обработки и отрисовки. Tkinter не используется.
+`scan_track.py` — скрипт OpenCV + pyFirmata2. Функции фильтрации и отрисовки
+находятся рядом в `image_utils.py`. Папка самостоятельная, файлы из `tof_opencv`
+не требуются. Tkinter не используется. При переносе копируйте всю папку.
 
 ## Запуск на Raspberry Pi
 
@@ -10,7 +10,7 @@
 
 ```sh
 python -m pip install pyFirmata2
-python tof_opencv/scan_track.py
+python tof_scan_tracker/scan_track.py
 ```
 
 Arduino Uno должен работать с StandardFirmata, как для `clue/servo.py`.
@@ -31,7 +31,7 @@ CH340/CH341, CP210x и FT232. USB-мост сам по себе не подтв�
 Проверка камеры, распознавания и расчёта углов **без подключения Arduino**:
 
 ```sh
-python tof_opencv/scan_track.py --no-servos
+python tof_scan_tracker/scan_track.py --no-servos
 ```
 
 Этот режим требует настоящую камеру, но не управляет приводами.
@@ -40,7 +40,7 @@ python tof_opencv/scan_track.py --no-servos
 и переключения на слежение:
 
 ```sh
-python tof_opencv/scan_track.py --scan-only
+python tof_scan_tracker/scan_track.py --scan-only
 ```
 
 Флаг `--scan-only` по умолчанию выключен. Без него действуют режимы SCAN/TRACK/WAIT.
@@ -80,7 +80,7 @@ python tof_opencv/scan_track.py --scan-only
 Прежние параметры сохранены, но min/max по умолчанию теперь 400/500:
 
 ```sh
-python tof_opencv/scan_track.py --port /dev/ttyACM0 \
+python tof_scan_tracker/scan_track.py --port /dev/ttyACM0 \
   --confidence 200 --min 400 --max 500 --tolerance 50 --min-area 80 \
   --lost-timeout 3
 ```
@@ -109,7 +109,7 @@ python tof_opencv/scan_track.py --port /dev/ttyACM0 \
 `--invert-x`; для вертикали аналогично `--invert-y`:
 
 ```sh
-python tof_opencv/scan_track.py --invert-x --invert-y
+python tof_scan_tracker/scan_track.py --invert-x --invert-y
 ```
 
 Для настройки можно сузить сектор, например `--x-min 70 --x-max 110 --y-min 70
@@ -126,5 +126,5 @@ python tof_opencv/scan_track.py --invert-x --invert-y
 ## Автоматические проверки без оборудования
 
 ```sh
-python -m unittest discover -s tof_opencv -p test_scan_track.py -v
+python -m unittest discover -s tof_scan_tracker -p test_scan_track.py -v
 ```

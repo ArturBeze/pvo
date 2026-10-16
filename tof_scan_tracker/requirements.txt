@@ -1,0 +1,5 @@
+numpy
+opencv-python
+pyFirmata2
+# ArducamDepthCamera and the camera driver must be installed on Raspberry Pi
+# using the manufacturer instructions, as for the working camera example.
