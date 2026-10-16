@@ -11,6 +11,7 @@ from time import monotonic
 import cv2
 import numpy as np
 from image_utils import valid_mask, render_depth, annotate_fragment
+from servo_sweep import ServoRig, SnakePath, resolve_port
 
 
 def parse_args(argv=None):
@@ -50,39 +51,13 @@ def parse_args(argv=None):
         p.error('Проверьте confidence, tolerance, min-area, index и lost-timeout')
     if not (20 <= a.x_min < a.x_max <= 160 and 30 <= a.y_min < a.y_max <= 150):
         p.error('Углы должны оставаться в пределах примера: X 20–160, Y 30–150')
+    if math.ceil(a.x_min) > math.floor(a.x_max) or math.ceil(a.y_min) > math.floor(a.y_max):
+        p.error('Диапазон каждой оси должен содержать хотя бы один целый угол')
     if min(a.scan_speed, a.scan_step, a.track_speed, a.gain, a.servo_hz, a.match_radius, a.match_depth) <= 0:
         p.error('Скорости, шаг и параметры сопоставления должны быть положительными')
     if a.servo_hz > 50 or not 0 <= a.dead_zone < 1 or a.match_radius > 1:
         p.error('servo-hz <= 50, 0 <= dead-zone < 1, match-radius <= 1')
     return a
-
-
-def resolve_port(port='auto', ports=None):
-    """Выбор по USB-описаниям без открытия посторонних последовательных портов."""
-    if port != 'auto':
-        return port
-    if ports is None:
-        from serial.tools import list_ports
-        ports = list_ports.comports()
-    arduino, bridges = set(), set()
-    for item in ports:
-        description = ' '.join(str(getattr(item, key, '') or '')
-                               for key in ('description', 'manufacturer', 'product')).lower()
-        vid = getattr(item, 'vid', None)
-        pid = getattr(item, 'pid', None)
-        if 'arduino' in description or vid in (0x2341, 0x2A03):
-            arduino.add(item.device)
-        elif ((vid, pid) in ((0x1A86, 0x7523), (0x1A86, 0x5523),
-                             (0x10C4, 0xEA60), (0x0403, 0x6001))
-              or any(name in description for name in ('ch340', 'ch341', 'cp210', 'ft232'))):
-            bridges.add(item.device)
-    candidates = sorted(arduino or bridges)
-    if len(candidates) == 1:
-        return candidates[0]
-    if not candidates:
-        raise RuntimeError('Arduino не найден автоматически. Подключите плату или задайте --port /dev/ttyACM0')
-    raise RuntimeError('Найдено несколько возможных Arduino: ' + ', '.join(candidates)
-                       + '. Выберите нужный через --port')
 
 
 def find_fragments(depth, confidence, args):
@@ -113,20 +88,11 @@ def find_fragments(depth, confidence, args):
     return fragments
 
 
-def approach(current, target, step):
-    return current + max(-step, min(step, target-current))
-
-
-class ScanTracker:
+class ScanTracker(SnakePath):
     """Контроллер без аппаратных зависимостей; время передаётся явно для тестов."""
     def __init__(self, args):
-        self.a = args
-        self.x = min(args.x_max, max(args.x_min, 90.))
-        self.y = min(args.y_max, max(args.y_min, 90.))
+        super().__init__(args)
         self.state = 'SCAN'
-        self.phase = 'HOME'
-        self.x_direction = self.y_direction = 1
-        self.row_target = args.y_min
         self.target = None
         self.last_seen = self.last_update = None
 
@@ -177,76 +143,11 @@ class ScanTracker:
         self.scan(dt)
         return None
 
-    def scan(self, dt):
-        step = self.a.scan_speed * dt
-        if self.phase == 'HOME':
-            self.x = approach(self.x, self.a.x_min, step)
-            self.y = approach(self.y, self.a.y_min, step)
-            if self.x == self.a.x_min and self.y == self.a.y_min:
-                self.phase = 'SWEEP'
-        elif self.phase == 'SWEEP':
-            edge = self.a.x_max if self.x_direction > 0 else self.a.x_min
-            self.x = approach(self.x, edge, step)
-            if self.x == edge:
-                if self.y >= self.a.y_max:
-                    self.y_direction = -1
-                elif self.y <= self.a.y_min:
-                    self.y_direction = 1
-                self.row_target = min(self.a.y_max, max(self.a.y_min,
-                    self.y + self.y_direction * self.a.scan_step))
-                self.phase = 'ROW'
-        else:
-            self.y = approach(self.y, self.row_target, step)
-            if self.y == self.row_target:
-                self.x_direction *= -1
-                self.phase = 'SWEEP'
-
-
-class ServoRig:
-    def __init__(self, args):
-        self.args = args
-        self.board = None
-        self.pins = None
-        self.last_command = None
-        self.last_time = -math.inf
-        if args.no_servos:
-            return
-        import pyfirmata2
-        port = resolve_port(args.port)
-        print(f'Порт Arduino: {port}', flush=True)
-        self.board = pyfirmata2.Arduino(port)
-        try:
-            # servo_config задаёт начальные углы сразу: get_pin(':s') в
-            # некоторых версиях библиотеки сначала устанавливает угол 0.
-            x = min(args.x_max, max(args.x_min, 90))
-            y = min(args.y_max, max(args.y_min, 90))
-            self.board.servo_config(9, angle=int(round(x)))
-            self.board.servo_config(10, angle=int(round(y)))
-            self.pins = self.board.digital[9], self.board.digital[10]
-        except Exception:
-            self.board.exit()
-            raise
-
-    def write(self, x, y, now):
-        if now - self.last_time < 1 / self.args.servo_hz:
-            return
-        angles = (int(round(min(self.args.x_max, max(self.args.x_min, x)))),
-                  int(round(min(self.args.y_max, max(self.args.y_min, y)))))
-        if self.pins:
-            for index, pin in enumerate(self.pins):
-                if self.last_command is None or angles[index] != self.last_command[index]:
-                    pin.write(angles[index])
-        self.last_command, self.last_time = angles, now
-
-    def close(self):
-        if self.board:
-            self.board.exit()
-
 
 def run(args):
     import ArducamDepthCamera as ac
     camera = ac.ArducamCamera()
-    opened = started = False
+    opened = started = window_created = False
     rig = None
     window = 'ToF scan / track | Q / Esc: exit'
     tracker = ScanTracker(args)
@@ -265,7 +166,9 @@ def run(args):
         print('Подключение Arduino…' if not args.no_servos else 'Режим без сервоприводов', flush=True)
         rig = ServoRig(args)
         cv2.namedWindow(window, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+        window_created = True
         cv2.resizeWindow(window, 960, 720)
+        cv2.imshow(window, np.zeros((180, 320, 3), np.uint8))
         last_received = last_report = monotonic()
         # Начальная команда позиционирования не имеет обратной связи.
         ready_at = last_received + 1
@@ -329,7 +232,11 @@ def run(args):
                 action()
             except Exception as exc:
                 print(f'Ошибка завершения: {exc}', file=sys.stderr)
-        cv2.destroyAllWindows()
+        if window_created:
+            try:
+                cv2.destroyAllWindows()
+            except Exception as exc:
+                print(f'Ошибка закрытия окна: {exc}', file=sys.stderr)
 
 
 def main():

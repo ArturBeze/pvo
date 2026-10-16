@@ -1,10 +1,13 @@
 """python -m unittest discover -s tof_scan_tracker -p test_scan_track.py -v"""
 import unittest
 from unittest.mock import patch
+import contextlib
+import io
 from types import SimpleNamespace
 import numpy as np
 from scan_track import parse_args, ScanTracker, ServoRig, find_fragments
 import scan_track
+import servo_sweep
 
 
 def target(x=.5, y=.5, distance=450, area=100):
@@ -120,7 +123,7 @@ class TrackerTests(unittest.TestCase):
             def servo_config(self,pin,angle): self.config.append((pin,angle))
             def exit(self): self.closed=True
         board=Board()
-        with patch.dict('sys.modules', {'pyfirmata2':SimpleNamespace(Arduino=lambda port:board)}):
+        with patch.object(servo_sweep, 'open_board', return_value=board):
             rig=ServoRig(parse_args(['--port','/dev/test']))
         self.assertEqual(board.config,[(9,90),(10,90)])
         rig.write(-100,500,0)
@@ -154,12 +157,88 @@ class TrackerTests(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(patch.dict('sys.modules',{'ArducamDepthCamera':sdk}))
             rig=stack.enter_context(patch.object(scan_track,'ServoRig')).return_value
-            for name in ('namedWindow','resizeWindow','destroyAllWindows'):
+            for name in ('namedWindow','resizeWindow','imshow','destroyAllWindows'):
                 stack.enter_context(patch.object(scan_track.cv2,name))
             with self.assertRaisesRegex(RuntimeError,'depth/confidence'):
                 scan_track.run(parse_args([]))
             rig.close.assert_called_once()
             rig.write.assert_not_called()
+        self.assertTrue(camera.released and camera.stopped and camera.closed)
+
+    def test_scan_matches_servo_sweep_trajectory(self):
+        args=parse_args(['--scan-only','--x-min','80','--x-max','100',
+                         '--y-min','80','--y-max','100'])
+        tracker=ScanTracker(args)
+        path=servo_sweep.SnakePath(args)
+        tracker.update([],0)
+        for i in range(1,1000):
+            path.scan(.05)
+            tracker.update([target()],i*.05)
+            self.assertAlmostEqual(tracker.x,path.x,places=6)
+            self.assertAlmostEqual(tracker.y,path.y,places=6)
+
+    def test_rejects_sector_without_integer_angle(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parse_args(['--x-min','80.1','--x-max','80.9'])
+
+    def test_tracking_never_exceeds_fractional_limits(self):
+        args=parse_args(['--x-min','80.6','--x-max','90.4',
+                         '--y-min','80.6','--y-max','90.4','--no-servos'])
+        tracker=ScanTracker(args)
+        rig=ServoRig(args)
+        for i in range(200):
+            tracker.update([target(1,1)], i*.1)
+            rig.write(tracker.x,tracker.y,i*.1)
+            self.assertTrue(all(80.6 <= angle <= 90.4 for angle in rig.last_command))
+
+    def test_usb_write_failure_keeps_original_error_and_releases_resources(self):
+        from contextlib import ExitStack
+        class Frame:
+            depth_data=np.full((12,12),450,np.float32)
+            confidence_data=np.full((12,12),300,np.float32)
+        class Camera:
+            released=stopped=closed=False
+            def open(self,*_): return 0
+            def start(self,*_): return 0
+            def setControl(self,*_): return 0
+            def getControl(self,*_): return 4000
+            def requestFrame(self,*_): return Frame()
+            def releaseFrame(self,*_): self.released=True
+            def stop(self): self.stopped=True
+            def close(self): self.closed=True
+        class Serial:
+            closed=False
+            def close(self): self.closed=True
+        instances=[]
+        class Pin:
+            def write(self,angle): raise OSError(5,'original write failed')
+        class Board:
+            def __init__(self,port):
+                self.sp=Serial()
+                self.digital=[Pin() for _ in range(14)]
+                self.exits=0
+                instances.append(self)
+            def servo_config(self,pin,angle): pass
+            def exit(self):
+                self.exits+=1
+                raise OSError('cleanup failed')
+        camera=Camera()
+        sdk=SimpleNamespace(ArducamCamera=lambda:camera,DepthData=Frame,
+            Connection=SimpleNamespace(CSI=0),FrameType=SimpleNamespace(DEPTH=0),
+            Control=SimpleNamespace(RANGE=0))
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict('sys.modules',{'ArducamDepthCamera':sdk,
+                'pyfirmata2':SimpleNamespace(Arduino=Board)}))
+            stack.enter_context(patch.object(scan_track,'monotonic',side_effect=[0,2,2.1]))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            for name in ('namedWindow','resizeWindow','imshow','destroyAllWindows'):
+                stack.enter_context(patch.object(scan_track.cv2,name))
+            with self.assertRaisesRegex(RuntimeError,'pin 9.*original write failed'):
+                scan_track.run(parse_args(['--port','/dev/test']))
+            instances[0].__del__()
+        self.assertEqual(instances[0].exits,1)
+        self.assertTrue(instances[0].sp.closed)
         self.assertTrue(camera.released and camera.stopped and camera.closed)
 
 
