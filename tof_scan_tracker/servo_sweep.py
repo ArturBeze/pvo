@@ -97,6 +97,55 @@ class SnakePath:
                 self.phase = 'SWEEP'
 
 
+def open_board(port, arduino_class=None):
+    """Закрыть USB даже при ошибке Firmata и не повторять exit из __del__."""
+    if arduino_class is None:
+        from pyfirmata2 import Arduino
+        arduino_class = Arduino
+
+    class ManagedArduino(arduino_class):
+        def __init__(self, device):
+            self._connection_closed = False
+            self._connection_ready = False
+            try:
+                super().__init__(device)
+                self._connection_ready = True
+            except BaseException:
+                self.exit()
+                raise
+
+        def exit(self):
+            if self._connection_closed:
+                return
+            self._connection_closed = True
+            serial_port = getattr(self, 'sp', None)
+            try:
+                if self._connection_ready:
+                    super().exit()
+            except Exception as exc:
+                # Вторичная ошибка не должна скрывать исходную ошибку записи.
+                print(f'Не удалось отключить серво через Firmata: {exc}', file=sys.stderr)
+            finally:
+                if serial_port is not None:
+                    try:
+                        serial_port.close()
+                    except Exception as exc:
+                        print(f'Не удалось закрыть порт {port}: {exc}', file=sys.stderr)
+
+        def __del__(self):
+            # Финализатор может вызываться для частично созданного объекта
+            # или при завершении Python, когда модули уже выгружены.
+            try:
+                self.exit()
+            except Exception:
+                pass
+
+    try:
+        return ManagedArduino(port)
+    except Exception as exc:
+        raise RuntimeError(f'Arduino {port}: ошибка подключения/инициализации: {exc}') from exc
+
+
 class ServoRig:
     def __init__(self, args):
         self.args = args
@@ -106,19 +155,21 @@ class ServoRig:
         self.last_time = -math.inf
         if args.no_servos:
             return
-        import pyfirmata2
         port = resolve_port(args.port)
+        self.port = port
         print(f'Порт Arduino: {port}', flush=True)
-        self.board = pyfirmata2.Arduino(port)
+        self.board = open_board(port)
         try:
             # servo_config задаёт начальные углы сразу: get_pin(':s') в
             # некоторых версиях библиотеки сначала устанавливает угол 0.
             x = min(args.x_max, max(args.x_min, 90))
             y = min(args.y_max, max(args.y_min, 90))
+            print('Настройка сервопривода X (pin 9)…', flush=True)
             self.board.servo_config(9, angle=int(round(x)))
+            print('Настройка сервопривода Y (pin 10)…', flush=True)
             self.board.servo_config(10, angle=int(round(y)))
             self.pins = self.board.digital[9], self.board.digital[10]
-        except Exception:
+        except BaseException:
             self.board.exit()
             raise
 
@@ -130,7 +181,11 @@ class ServoRig:
         if self.pins:
             for index, pin in enumerate(self.pins):
                 if self.last_command is None or angles[index] != self.last_command[index]:
-                    pin.write(angles[index])
+                    try:
+                        pin.write(angles[index])
+                    except Exception as exc:
+                        raise RuntimeError(f'Arduino {self.port}: запись угла {angles[index]}° '
+                                           f'на pin {9 + index} не выполнена: {exc}') from exc
         self.last_command, self.last_time = angles, now
 
     def close(self):
@@ -161,7 +216,7 @@ def run(args):
             sleep(1 / (2*args.servo_hz))
     finally:
         rig.close()
-        print('Проверка завершена. Соединение с Arduino закрыто.', flush=True)
+        print('Проверка завершена.', flush=True)
 
 
 def main():
