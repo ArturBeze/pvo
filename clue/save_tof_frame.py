@@ -53,6 +53,8 @@ def capture_frame():
                     continue
                 depth_data = frame.depth_data
                 confidence_data = getattr(frame, "confidence_data", None)
+                print(depth_data)
+                print(confidence_data)
                 if depth_data is None or confidence_data is None:
                     raise RuntimeError("Камера не предоставила depth и confidence")
                 # Буферы принадлежат SDK: копируем до releaseFrame.
