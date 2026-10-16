@@ -4,11 +4,14 @@
 Параметры: --index 0 --range 4000 (или 2000).
 Нужны ArducamDepthCamera, numpy, opencv-python, Pillow и tkinter.
 Остановите другие программы, использующие эту камеру, перед запуском.
+Камера работает в отдельном процессе; --demo проверяет окно без камеры.
 Файлы не записываются. Для повторного подключения перезапустите скрипт.
 """
 import argparse
 import math
-from threading import Event, Lock, Thread
+import multiprocessing as mp
+from queue import Empty, Full
+import traceback
 from time import monotonic
 import tkinter as tk
 from tkinter import ttk
@@ -20,46 +23,61 @@ from PIL import Image, ImageTk
 from filter_images import depth_mask
 
 
-class CameraStream:
-    """SDK используется только в рабочем потоке; хранится один последний кадр."""
-    def __init__(self, index=0, range_mm=4000, sdk=None):
+class CaptureWorker:
+    """Все обращения к SDK выполняются внутри дочернего процесса."""
+    def __init__(self, index, range_mm, stop_event, frames, messages, sdk=None):
         self.index, self.range_mm, self.sdk = index, range_mm, sdk
-        self.stop_event = Event()
-        self.lock = Lock()
-        self.frame = None
-        self.error = None
-        self.thread = Thread(target=self.run, name="tof-capture", daemon=True)
+        self.stop_event, self.frames, self.messages = stop_event, frames, messages
 
-    def snapshot(self):
-        with self.lock:
-            return self.frame, self.error
+    def report(self, text, kind="status"):
+        print(f"[ToF] {text}", flush=True)
+        self.messages.put((kind, text))
 
     def report_error(self, message):
-        with self.lock:
-            self.error = f"{self.error}; {message}" if self.error else message
+        self.report(message, "error")
+
+    def publish(self, frame):
+        # Очередь ограничена двумя кадрами. При перегрузке удаляем старый.
+        try:
+            self.frames.put_nowait(frame)
+        except Full:
+            try:
+                self.frames.get_nowait()
+            except Empty:
+                pass
+            try:
+                self.frames.put_nowait(frame)
+            except Full:
+                pass
 
     def run(self):
         camera = None
         opened = started = False
         try:
+            self.report("Загрузка ArducamDepthCamera…")
             ac = self.sdk
             if ac is None:
                 import ArducamDepthCamera as ac
+            self.report("Создание объекта камеры…")
             camera = ac.ArducamCamera()
+            self.report("Открытие камеры…")
             result = camera.open(ac.Connection.CSI, self.index)
             if result != 0:
                 raise RuntimeError(f"Не удалось открыть камеру: {result}")
             opened = True
+            self.report("Запуск потока глубины…")
             result = camera.start(ac.FrameType.DEPTH)
             if result != 0:
                 raise RuntimeError(f"Не удалось запустить камеру: {result}")
             started = True
+            self.report("Настройка диапазона…")
             result = camera.setControl(ac.Control.RANGE, self.range_mm)
             if result not in (None, 0):
                 raise RuntimeError(f"Не удалось установить диапазон: {result}")
             actual = camera.getControl(ac.Control.RANGE)
             if actual != self.range_mm:
                 raise RuntimeError(f"Камера вернула диапазон {actual} вместо {self.range_mm} мм")
+            self.report("Ожидание первого кадра…")
             sequence = 0
             last_frame = monotonic()
             while not self.stop_event.is_set():
@@ -86,8 +104,9 @@ class CameraStream:
                     confidence.setflags(write=False)
                     sequence += 1
                     last_frame = monotonic()
-                    with self.lock:
-                        self.frame = (sequence, last_frame, depth, confidence)
+                    self.publish((sequence, last_frame, depth, confidence))
+                    if sequence == 1:
+                        self.report("Получен первый кадр")
                 finally:
                     camera.releaseFrame(frame)
         except Exception as exc:
@@ -96,9 +115,74 @@ class CameraStream:
             for method, needed in (("stop", started), ("close", opened)):
                 if needed:
                     try:
+                        self.report(f"Освобождение камеры: {method}…")
                         getattr(camera, method)()
                     except Exception as exc:
                         self.report_error(f"{method}: {exc}")
+
+
+def capture_process(index, range_mm, stop_event, frames, messages, demo):
+    # Не ждём отправки кадров в уже закрытое окно при завершении процесса.
+    frames.cancel_join_thread()
+    worker = CaptureWorker(index, range_mm, stop_event, frames, messages)
+    if not demo:
+        worker.run()
+        return
+    worker.report("Демонстрация без камеры")
+    y, x = np.mgrid[:180, :240]
+    sequence = 0
+    while not stop_event.is_set():
+        sequence += 1
+        depth = np.full(x.shape, range_mm * .7, dtype=np.float32)
+        center = 120 + 60 * np.sin(sequence / 30)
+        depth[(x - center)**2 + (y - 90)**2 < 35**2] = range_mm * .25
+        confidence = np.full(x.shape, 500, dtype=np.float32)
+        confidence[:, :60] = 20
+        worker.publish((sequence, monotonic(), depth, confidence))
+        stop_event.wait(1 / 30)
+
+
+class CameraStream:
+    """Интерфейс окна к камере; spawn не наследует состояние Tcl/Tk."""
+    def __init__(self, index=0, range_mm=4000, demo=False):
+        self.range_mm = range_mm
+        context = mp.get_context("spawn")
+        self.stop_event = context.Event()
+        self.frames = context.Queue(maxsize=2)
+        self.messages = context.Queue()
+        self.process = context.Process(target=capture_process,
+            args=(index, range_mm, self.stop_event, self.frames, self.messages, demo),
+            name="tof-camera", daemon=True)
+        self.frame = self.error = None
+        self.status = "Окно готово. Запуск камеры…"
+        self.started = False
+
+    def start(self):
+        self.process.start()
+        self.started = True
+
+    def snapshot(self):
+        for _ in range(32):
+            try:
+                kind, message = self.messages.get_nowait()
+            except Empty:
+                break
+            if kind == "error":
+                self.error = message
+            else:
+                self.status = message
+        for _ in range(2):
+            try:
+                self.frame = self.frames.get_nowait()
+            except Empty:
+                break
+        if self.started and not self.process.is_alive() and not self.stop_event.is_set():
+            self.error = self.error or f"Процесс камеры завершился (код {self.process.exitcode})"
+        return self.frame, self.error
+
+    def dispose(self):
+        self.frames.close()
+        self.messages.close()
 
 
 def make_images(depth, confidence, threshold, minimum, maximum, range_mm):
@@ -165,8 +249,22 @@ class LiveViewer:
         ttk.Button(controls, text="Закрыть", command=self.close).grid(row=5, column=1, sticky="e")
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.bind("<Escape>", lambda _event: self.close())
-        stream.thread.start()
+        self.start_id = root.after(200, self.start_camera)
         self.after_id = root.after(15, self.tick)
+        root.report_callback_exception = self.callback_error
+
+    def start_camera(self):
+        if self.closing:
+            return
+        try:
+            self.stream.start()
+        except Exception as exc:
+            self.stream.error = f"Не удалось запустить процесс камеры: {exc}"
+            print(self.stream.error, flush=True)
+
+    def callback_error(self, exc_type, exc, tb):
+        traceback.print_exception(exc_type, exc, tb)
+        self.status.set(f"Ошибка интерфейса: {exc}. Подробности в консоли.")
 
     def changed(self, key):
         if "maximum" not in self.variables:
@@ -207,6 +305,8 @@ class LiveViewer:
                                 f"осталось {self.kept:,} из {depth.size:,} ({self.kept / depth.size:.1%}) • "
                                 f"возраст кадра {age * 1000:.0f} мс"
                                 + (" — ожидание новых кадров…" if age > 1 else ""))
+            if frame is None:
+                self.status.set(self.stream.status)
             if error:
                 self.status.set(f"Ошибка камеры: {error}. Для подключения перезапустите скрипт.")
         except Exception as exc:
@@ -232,17 +332,25 @@ class LiveViewer:
             return
         self.closing = True
         self.root.after_cancel(self.after_id)
+        self.root.after_cancel(self.start_id)
+        self.close_started = monotonic()
         self.stream.stop_event.set()
         self.status.set("Остановка и освобождение камеры…")
         self.wait_for_camera()
 
     def wait_for_camera(self):
-        # Не блокируем Tkinter через join: SDK сам завершает stop/close.
-        # Если нативный SDK зависнет, принудительно прервать его поток нельзя.
-        if self.stream.thread.is_alive():
+        process = self.stream.process
+        if self.stream.started and process.is_alive():
+            if monotonic() - self.close_started > 3:
+                self.status.set("SDK не отвечает. Завершение процесса камеры…")
+                if monotonic() - self.close_started > 5:
+                    process.kill()
+                else:
+                    process.terminate()
             self.root.after(50, self.wait_for_camera)
         else:
-            self.stream.thread.join()
+            if self.stream.started:
+                process.join()
             self.root.destroy()
 
 
@@ -250,17 +358,26 @@ def main():
     parser = argparse.ArgumentParser(description="Живая фильтрация Arducam ToF")
     parser.add_argument("--index", type=int, default=0, help="Индекс камеры в SDK")
     parser.add_argument("--range", type=int, choices=(2000, 4000), default=4000, dest="range_mm")
+    parser.add_argument("--demo", action="store_true", help="Проверить окно и обмен кадрами без SDK камеры")
     args = parser.parse_args()
     root = tk.Tk()
-    stream = CameraStream(args.index, args.range_mm)
+    stream = CameraStream(args.index, args.range_mm, args.demo)
     try:
         LiveViewer(root, stream)
         root.mainloop()
     finally:
         stream.stop_event.set()
-        if stream.thread.ident is not None:
-            stream.thread.join(timeout=3)
+        if stream.started:
+            stream.process.join(timeout=3)
+            if stream.process.is_alive():
+                stream.process.terminate()
+                stream.process.join(timeout=2)
+            if stream.process.is_alive():
+                stream.process.kill()
+                stream.process.join(timeout=1)
+        stream.dispose()
 
 
 if __name__ == "__main__":
+    mp.freeze_support()
     main()
