@@ -26,8 +26,10 @@ def parse_args(argv=None):
         p.error('Значения должны быть конечными')
     if not (20 <= a.x_min < a.x_max <= 160 and 30 <= a.y_min < a.y_max <= 150):
         p.error('Допустимые границы: X 20–160°, Y 30–150°')
+    if math.ceil(a.x_min) > math.floor(a.x_max) or math.ceil(a.y_min) > math.floor(a.y_max):
+        p.error('Диапазон каждой оси должен содержать хотя бы один целый угол')
     if min(a.scan_speed,a.scan_step,a.servo_hz) <= 0 or a.servo_hz > 50:
-        p.error('Скорость и шаг должны быть положительными, частота команд — от 0 до 50 Гц')
+        p.error('Скорость и шаг должны быть положительными, частота команд — больше 0 и не больше 50 Гц')
     return a
 
 
@@ -61,6 +63,11 @@ def resolve_port(port='auto', ports=None):
 
 def approach(current, target, step):
     return current + max(-step, min(step, target-current))
+
+
+def servo_angle(value, minimum, maximum):
+    """Firmata принимает целые градусы: округление не должно выйти за границы."""
+    return max(math.ceil(minimum), min(math.floor(maximum), int(round(value))))
 
 
 class SnakePath:
@@ -165,9 +172,9 @@ class ServoRig:
             x = min(args.x_max, max(args.x_min, 90))
             y = min(args.y_max, max(args.y_min, 90))
             print('Настройка сервопривода X (pin 9)…', flush=True)
-            self.board.servo_config(9, angle=int(round(x)))
+            self.board.servo_config(9, angle=servo_angle(x, args.x_min, args.x_max))
             print('Настройка сервопривода Y (pin 10)…', flush=True)
-            self.board.servo_config(10, angle=int(round(y)))
+            self.board.servo_config(10, angle=servo_angle(y, args.y_min, args.y_max))
             self.pins = self.board.digital[9], self.board.digital[10]
         except BaseException:
             self.board.exit()
@@ -176,8 +183,8 @@ class ServoRig:
     def write(self, x, y, now):
         if now - self.last_time < 1 / self.args.servo_hz:
             return
-        angles = (int(round(min(self.args.x_max, max(self.args.x_min, x)))),
-                  int(round(min(self.args.y_max, max(self.args.y_min, y)))))
+        angles = (servo_angle(x, self.args.x_min, self.args.x_max),
+                  servo_angle(y, self.args.y_min, self.args.y_max))
         if self.pins:
             for index, pin in enumerate(self.pins):
                 if self.last_command is None or angles[index] != self.last_command[index]:
