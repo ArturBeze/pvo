@@ -17,6 +17,7 @@ def target(x=.5, y=.5, distance=450, area=100):
 class TrackerTests(unittest.TestCase):
     def test_defaults(self):
         a = parse_args([])
+        self.assertEqual((a.gain,a.track_speed,a.dead_zone,a.servo_hz), (60,80,.05,30))
         self.assertEqual((a.min, a.max, a.confidence, a.lost_timeout), (400, 500, 200, 3))
         self.assertEqual((a.x_min,a.x_max,a.y_min,a.y_max), (40,140,55,125))
         self.assertEqual(a.port, 'auto')
@@ -107,8 +108,8 @@ class TrackerTests(unittest.TestCase):
         t = ScanTracker(parse_args([]))
         t.update([target(1,1)], 0)
         t.update([target(1,1)], 100)
-        self.assertLessEqual(abs(t.x-90), 4)
-        self.assertLessEqual(abs(t.y-90), 4)
+        self.assertLessEqual(abs(t.x-90), t.a.track_speed * .1)
+        self.assertLessEqual(abs(t.y-90), t.a.track_speed * .1)
 
     def test_fragment_filter_and_centroid(self):
         d = np.zeros((10,10), np.float32)
