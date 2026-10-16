@@ -70,7 +70,7 @@ class ServoSweepTests(unittest.TestCase):
     def test_defaults_and_reject_invalid_arguments(self):
         args = sweep.parse_args([])
         self.assertEqual((args.port,args.x_min,args.x_max,args.y_min,args.y_max),
-                         ('auto',20,160,30,150))
+                         ('auto',40,140,55,125))
         for flags in (['--scan-speed','nan'], ['--servo-hz','0'],
                       ['--x-min','19'], ['--y-max','151'],
                       ['--x-min','80.1','--x-max','80.9']):
@@ -109,10 +109,10 @@ class ServoSweepTests(unittest.TestCase):
         rig.write(0,200,0)
         rig.write(90,90,.01)
         board.digital[9].write.assert_called_once_with(81)
-        board.digital[10].write.assert_called_once_with(150)
+        board.digital[10].write.assert_called_once_with(125)
         rig.write(200,0,.1)
         board.digital[9].write.assert_called_with(100)
-        board.digital[10].write.assert_called_with(30)
+        board.digital[10].write.assert_called_with(55)
         rig.write(200,0,.2)
         self.assertEqual(board.digital[9].write.call_count,2)
 

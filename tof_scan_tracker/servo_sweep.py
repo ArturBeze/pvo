@@ -13,8 +13,8 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument('--port', default='auto', help='Порт Arduino или auto')
     for name, default, text in (
-        ('x-min',20,'Минимальный угол X'), ('x-max',160,'Максимальный угол X'),
-        ('y-min',30,'Минимальный угол Y'), ('y-max',150,'Максимальный угол Y'),
+        ('x-min',40,'Минимальный угол X'), ('x-max',140,'Максимальный угол X'),
+        ('y-min',55,'Минимальный угол Y'), ('y-max',125,'Максимальный угол Y'),
         ('scan-speed',20,'Скорость движения, градусов/сек'),
         ('scan-step',10,'Расстояние между строками по Y, градусов'),
         ('servo-hz',20,'Максимальная частота команд')):

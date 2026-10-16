@@ -18,6 +18,7 @@ class TrackerTests(unittest.TestCase):
     def test_defaults(self):
         a = parse_args([])
         self.assertEqual((a.min, a.max, a.confidence, a.lost_timeout), (400, 500, 200, 3))
+        self.assertEqual((a.x_min,a.x_max,a.y_min,a.y_max), (40,140,55,125))
         self.assertEqual(a.port, 'auto')
         self.assertFalse(a.scan_only)
         self.assertTrue(a.invert_x)
@@ -138,10 +139,10 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual(board.config,[(9,90),(10,90)])
         rig.write(-100,500,0)
         rig.write(90,90,.01)
-        self.assertEqual(board.digital[9].values,[20])
-        self.assertEqual(board.digital[10].values,[150])
+        self.assertEqual(board.digital[9].values,[40])
+        self.assertEqual(board.digital[10].values,[125])
         rig.write(90,90,.1)
-        self.assertEqual(board.digital[9].values,[20,90])
+        self.assertEqual(board.digital[9].values,[40,90])
         rig.close()
         self.assertTrue(board.closed)
 
