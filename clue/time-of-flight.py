@@ -117,6 +117,8 @@ def main():
         if frame is not None and isinstance(frame, ac.DepthData):
             depth_buf = frame.depth_data
             confidence_buf = frame.confidence_data
+            print('depth_buf min/max', depth_buf.min(), depth_buf.max())
+            print('confidence_buf min/max', confidence_buf.min(), confidence_buf.max())
 
             result_image = (depth_buf * (255.0 / r)).astype(np.uint8)
             result_image = cv2.applyColorMap(result_image, cv2.COLORMAP_RAINBOW)
