@@ -76,17 +76,30 @@ def find_fragments(depth, confidence, args):
                         (np.abs(safe[1:] - safe[:-1]) <= args.tolerance))
     _, labels = cv2.connectedComponents(graph, connectivity=4)
     labels = labels[::2, ::2]
-    areas = np.bincount(labels.ravel())
+    # Группируем индексы один раз: суммарная память O(числа пикселей),
+    # а не полная маска кадра на каждый из K фрагментов.
+    flat_labels = labels.ravel()
+    areas = np.bincount(flat_labels)
+    grouped_indices = np.argsort(flat_labels, kind='stable')
+    boundaries = np.concatenate(([0], np.cumsum(areas)))
+    flat_depth = depth.ravel()
+    flat_confidence = confidence.ravel()
     fragments = []
     for label in np.flatnonzero(areas >= args.min_area):
         if label == 0:
             continue
-        mask = labels == label
-        y, x = np.nonzero(mask)
-        fragments.append(dict(mask=mask, area=int(areas[label]),
-            distance=float(np.median(depth[mask])), confidence=float(np.median(confidence[mask])),
-            center=(float(x.mean()) / max(1, w-1), float(y.mean()) / max(1, h-1))))
+        indices = grouped_indices[boundaries[label]:boundaries[label + 1]]
+        y, x = np.divmod(indices, w)
+        fragments.append({
+            'indices': indices,
+            'area': int(areas[label]),
+            'distance': float(np.median(flat_depth[indices])),
+            'confidence': float(np.median(flat_confidence[indices])),
+            'center': (float(x.mean()) / max(1, w - 1),
+                       float(y.mean()) / max(1, h - 1)),
+        })
     return fragments
+
 
 
 class ScanTracker(SnakePath):
@@ -97,52 +110,103 @@ class ScanTracker(SnakePath):
         self.target = None
         self.last_seen = self.last_update = None
 
+    def select_target(self, fragments):
+        if self.state == 'SCAN':
+            return min(fragments, key=lambda f: (f['distance'], -f['area']), default=None)
+
+        # Не перескакиваем на любой новый предмет: сопоставляем центр и глубину.
+        candidates = []
+        for fragment in fragments:
+            dx = fragment['center'][0] - self.target['center'][0]
+            dy = fragment['center'][1] - self.target['center'][1]
+            offset = math.hypot(dx, dy)
+            depth_change = abs(fragment['distance'] - self.target['distance'])
+            if offset <= self.a.match_radius and depth_change <= self.a.match_depth:
+                score = offset / self.a.match_radius + depth_change / self.a.match_depth
+                candidates.append((score, fragment))
+        return min(candidates, key=lambda item: item[0])[1] if candidates else None
+
+    def follow_target(self, target, now, dt):
+        self.cancel_pending_turn()
+        self.target = {key: target[key] for key in ('center', 'distance')}
+        self.last_seen = now
+        self.state = 'TRACK'
+        axes = (
+            ('x', target['center'][0], self.a.invert_x, self.a.x_min, self.a.x_max),
+            ('y', target['center'][1], self.a.invert_y, self.a.y_min, self.a.y_max),
+        )
+        for axis, center, invert, minimum, maximum in axes:
+            error = 2 * (center - .5)
+            if abs(error) <= self.a.dead_zone:
+                continue
+            speed = min(self.a.track_speed, self.a.gain * abs(error))
+            delta = math.copysign(speed * dt, error) * (-1 if invert else 1)
+            angle = min(maximum, max(minimum, getattr(self, axis) + delta))
+            setattr(self, axis, angle)
+
+    def resume_scan(self):
+        self.state = 'SCAN'
+        self.target = None
+        self.cancel_pending_turn()
+        self.phase = 'SWEEP'
+        self.x_direction = 1 if self.x < (self.a.x_min + self.a.x_max) / 2 else -1
+        self.y_direction = 1 if self.y < (self.a.y_min + self.a.y_max) / 2 else -1
+
     def update(self, fragments, now):
-        dt = 0 if self.last_update is None else min(.1, max(0, now-self.last_update))
+        dt = 0 if self.last_update is None else min(.1, max(0, now - self.last_update))
         self.last_update = now
         if self.a.scan_only:
             self.state, self.target = 'SCAN', None
             self.scan(dt)
             return None
-        if self.state == 'SCAN':
-            target = min(fragments, key=lambda f: (f['distance'], -f['area']), default=None)
-        else:
-            # Не перескакиваем на любой новый ближайший предмет: ищем рядом
-            # с предыдущим центром и глубиной. Это геометрическое сопоставление.
-            candidates = []
-            for f in fragments:
-                dx = f['center'][0] - self.target['center'][0]
-                dy = f['center'][1] - self.target['center'][1]
-                offset = math.hypot(dx, dy)
-                delta = abs(f['distance'] - self.target['distance'])
-                if offset <= self.a.match_radius and delta <= self.a.match_depth:
-                    candidates.append((offset / self.a.match_radius + delta / self.a.match_depth, f))
-            target = min(candidates, key=lambda item: item[0])[1] if candidates else None
+
+        target = self.select_target(fragments)
         if target is not None:
-            self.target = {k: target[k] for k in ('center', 'distance')}
-            self.last_seen = now
-            self.state = 'TRACK'
-            for axis, center, invert, low, high in (
-                ('x', target['center'][0], self.a.invert_x, self.a.x_min, self.a.x_max),
-                ('y', target['center'][1], self.a.invert_y, self.a.y_min, self.a.y_max)):
-                error = 2 * (center - .5)
-                if abs(error) <= self.a.dead_zone:
-                    continue
-                speed = min(self.a.track_speed, self.a.gain * abs(error))
-                delta = math.copysign(speed * dt, error) * (-1 if invert else 1)
-                setattr(self, axis, min(high, max(low, getattr(self, axis)+delta)))
+            self.follow_target(target, now, dt)
             return target
+
         if self.state != 'SCAN':
             self.state = 'WAIT'
             if now - self.last_seen < self.a.lost_timeout:
-                return None  # Держим последние углы, не продолжаем старую коррекцию.
-            self.state, self.target = 'SCAN', None
-            # Возобновляем горизонтальный проход с текущего положения.
-            self.phase = 'SWEEP'
-            self.x_direction = 1 if self.x < (self.a.x_min+self.a.x_max)/2 else -1
-            self.y_direction = 1 if self.y < (self.a.y_min+self.a.y_max)/2 else -1
+                return None  # Держим последние углы до возвращения цели или тайм-аута.
+            self.resume_scan()
         self.scan(dt)
         return None
+
+
+def process_frame(frame, sdk, args, tracker, now, ready_at):
+    """Обработать буферы до releaseFrame; вернуть независимое изображение."""
+    if not isinstance(frame, sdk.DepthData):
+        raise RuntimeError('Камера вернула кадр без глубины')
+    depth = frame.depth_data
+    confidence = getattr(frame, 'confidence_data', None)
+    if (depth is None or confidence is None or depth.ndim != 2 or not depth.size
+            or confidence.shape != depth.shape or depth.dtype.kind not in 'uif'
+            or confidence.dtype.kind not in 'uif'):
+        raise RuntimeError('Камера не предоставила корректные depth/confidence')
+
+    fragments = [] if args.scan_only else find_fragments(depth, confidence, args)
+    target = tracker.update(fragments, now) if now >= ready_at else None
+    image = render_depth(depth, confidence, args.confidence, args.min, args.max)
+    height, width = depth.shape
+    cv2.drawMarker(image, (width // 2, height // 2), (255, 255, 255), cv2.MARKER_CROSS, 9, 1)
+    if target is not None:
+        cx, cy = target['center']
+        center = (round(cx * (width - 1)), round(cy * (height - 1)))
+        cv2.circle(image, center, 3, (255, 255, 255), 1)
+    if not args.scan_only:
+        image = annotate_fragment(image, target)
+
+    state = tracker.state if now >= ready_at else 'START'
+    text = f'{state} X:{tracker.x:.0f} Y:{tracker.y:.0f}'
+    if args.scan_only:
+        text += ' | scan only'
+    if state == 'WAIT':
+        remaining = max(0, args.lost_timeout - (now - tracker.last_seen))
+        text += f' wait:{remaining:.1f}s'
+    image = cv2.copyMakeBorder(image, 22, 0, 0, 0, cv2.BORDER_CONSTANT)
+    cv2.putText(image, text, (4, 15), cv2.FONT_HERSHEY_SIMPLEX, .4, (255, 255, 255), 1)
+    return image, target, text
 
 
 def run(args):
@@ -178,36 +242,14 @@ def run(args):
             frame = camera.requestFrame(100)
             if frame is not None:
                 try:
-                    if not isinstance(frame, ac.DepthData):
-                        raise RuntimeError('Камера вернула кадр без глубины')
-                    depth, confidence = frame.depth_data, getattr(frame, 'confidence_data', None)
-                    if (depth is None or confidence is None or depth.ndim != 2 or not depth.size
-                            or confidence.shape != depth.shape or depth.dtype.kind not in 'uif'
-                            or confidence.dtype.kind not in 'uif'):
-                        raise RuntimeError('Камера не предоставила корректные depth/confidence')
                     now = monotonic()
-                    fragments = [] if args.scan_only else find_fragments(depth, confidence, args)
-                    target = tracker.update(fragments, now) if now >= ready_at else None
-                    image = render_depth(depth, confidence, args.confidence, args.min, args.max)
-                    h, w = depth.shape
-                    cv2.drawMarker(image, (w//2, h//2), (255,255,255), cv2.MARKER_CROSS, 9, 1)
-                    if target is not None:
-                        cx, cy = target['center']
-                        cv2.circle(image, (round(cx*(w-1)), round(cy*(h-1))), 3, (255,255,255), 1)
-                    if not args.scan_only:
-                        image = annotate_fragment(image, target)
-                    state = tracker.state if now >= ready_at else 'START'
-                    remaining = max(0, args.lost_timeout-(now-tracker.last_seen)) if state == 'WAIT' else 0
-                    text = f'{state} X:{tracker.x:.0f} Y:{tracker.y:.0f}'
-                    if args.scan_only: text += ' | scan only'
-                    if state == 'WAIT': text += f' wait:{remaining:.1f}s'
-                    image = cv2.copyMakeBorder(image, 22, 0, 0, 0, cv2.BORDER_CONSTANT)
-                    cv2.putText(image, text, (4,15), cv2.FONT_HERSHEY_SIMPLEX, .4, (255,255,255), 1)
+                    image, target, text = process_frame(frame, ac, args, tracker, now, ready_at)
                 finally:
                     camera.releaseFrame(frame)
                 last_received = monotonic()
                 if now >= ready_at:
-                    rig.write(tracker.x, tracker.y, last_received)
+                    if rig.write(tracker.x, tracker.y, last_received):
+                        tracker.position_sent()
                 cv2.imshow(window, image)
                 if last_received-last_report >= 1:
                     details = (f" | {target['distance']:.1f} мм | confidence {target['confidence']:.1f}"

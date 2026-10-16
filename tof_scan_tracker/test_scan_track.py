@@ -97,6 +97,7 @@ class TrackerTests(unittest.TestCase):
         for i in range(1000):
             old_phase = t.phase
             t.update([], i*.05)
+            t.position_sent()
             self.assertTrue(80 <= t.x <= 100 and 80 <= t.y <= 100)
             if old_phase != 'SWEEP' and t.phase == 'SWEEP':
                 rows.append((t.y,t.x_direction))
@@ -121,6 +122,44 @@ class TrackerTests(unittest.TestCase):
         self.assertAlmostEqual(f[0]['center'][1],3.5/9)
         d[2:6,3:7] = 501
         self.assertEqual(find_fragments(d,c,a),[])
+
+    def test_fragment_indices_preserve_holes_and_separate_surfaces(self):
+        depth = np.array([[450,450,0,500,500],
+                          [450,450,0,500,500],
+                          [0,0,0,0,0]], dtype=np.float32)
+        confidence = np.full(depth.shape,300,np.float32)
+        confidence[0,0] = 199
+        fragments = find_fragments(depth,confidence,parse_args(['--min-area','3']))
+        self.assertEqual(len(fragments),2)
+        near, far = sorted(fragments,key=lambda f:f['distance'])
+        np.testing.assert_array_equal(np.sort(near['indices']),[1,5,6])
+        self.assertEqual((near['area'],near['distance'],near['confidence']),(3,450,300))
+        self.assertEqual(far['area'],4)
+        # Отрисовка создаёт маску лишь выбранной цели.
+        image = np.zeros((*depth.shape,3),np.uint8)
+        annotated = scan_track.annotate_fragment(image,near)
+        self.assertEqual(annotated.shape[0],depth.shape[0]+44)
+        self.assertTrue(image[0,1].any())
+        self.assertFalse(image[0,0].any())
+
+    def test_depth_edges_and_diagonal_contacts(self):
+        depth = np.array([[400,450,0], [0,0,500]],np.float32)
+        confidence = np.full(depth.shape,300,np.float32)
+        fragments = find_fragments(depth,confidence,parse_args(['--min-area','1']))
+        self.assertEqual(sorted(f['area'] for f in fragments),[1,2])
+        fragments = find_fragments(depth,confidence,parse_args(['--min-area','1','--tolerance','49']))
+        self.assertEqual(len(fragments),3)
+
+    def test_many_fragments_store_each_pixel_only_once(self):
+        depth = np.zeros((180,240),np.float32)
+        for y in range(0,180,10):
+            for x in range(0,240,10):
+                depth[y:y+9,x:x+9]=450
+        fragments = find_fragments(depth,np.full_like(depth,300),parse_args([]))
+        self.assertEqual(len(fragments),432)
+        indices = np.concatenate([f['indices'] for f in fragments])
+        np.testing.assert_array_equal(np.sort(indices),np.flatnonzero(depth))
+        self.assertLess(indices.nbytes,depth.size*8)
 
     def test_servo_pins_limits_and_command_rate(self):
         class Pin:
@@ -184,9 +223,41 @@ class TrackerTests(unittest.TestCase):
         tracker.update([],0)
         for i in range(1,1000):
             path.scan(.05)
+            path.position_sent()
             tracker.update([target()],i*.05)
+            tracker.position_sent()
             self.assertAlmostEqual(tracker.x,path.x,places=6)
             self.assertAlmostEqual(tracker.y,path.y,places=6)
+
+    def test_low_command_rate_preserves_snake_corners(self):
+        args = parse_args(['--scan-only','--no-servos','--servo-hz','1'])
+        tracker, rig = ScanTracker(args), ServoRig(args)
+        commands = []
+        for i in range(1500):
+            now = i / 30
+            tracker.update([],now)
+            if rig.write(tracker.x,tracker.y,now):
+                if tracker.phase != 'HOME':
+                    commands.append(rig.last_command)
+                tracker.position_sent()
+        self.assertIn((140,55),commands)
+        self.assertIn((140,65),commands)
+        self.assertIn((40,65),commands)
+        for first, second in zip(commands,commands[1:]):
+            self.assertTrue(first[0] == second[0] or first[1] == second[1],
+                            f'Диагональная команда: {first} -> {second}')
+
+    def test_target_can_interrupt_pending_turn(self):
+        tracker = ScanTracker(parse_args([]))
+        tracker.phase = 'SWEEP'
+        tracker.x = tracker.a.x_max
+        tracker.scan(.1)
+        self.assertEqual(tracker.pending_phase,'ROW')
+        tracker.update([target()],0)
+        self.assertEqual(tracker.state,'TRACK')
+        self.assertIsNone(tracker.pending_phase)
+        tracker.update([],4)
+        self.assertEqual(tracker.state,'SCAN')
 
     def test_rejects_sector_without_integer_angle(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

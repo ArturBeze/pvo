@@ -78,14 +78,31 @@ class SnakePath:
         self.phase = 'HOME'
         self.x_direction = self.y_direction = 1
         self.row_target = args.y_min
+        self.pending_phase = None
+
+    def cancel_pending_turn(self):
+        self.pending_phase = None
+
+    def position_sent(self):
+        """Подтверждение отправки команды, НЕ измерение положения сервопривода."""
+        if self.pending_phase is None:
+            return
+        if self.phase == 'ROW':
+            self.x_direction *= -1
+        self.phase = self.pending_phase
+        self.pending_phase = None
 
     def scan(self, dt):
+        # На повороте держим конечные углы до отправки их через ограничитель
+        # частоты. Иначе при редких командах можно срезать угол змейки.
+        if self.pending_phase is not None:
+            return
         step = self.a.scan_speed * dt
         if self.phase == 'HOME':
             self.x = approach(self.x, self.a.x_min, step)
             self.y = approach(self.y, self.a.y_min, step)
             if self.x == self.a.x_min and self.y == self.a.y_min:
-                self.phase = 'SWEEP'
+                self.pending_phase = 'SWEEP'
         elif self.phase == 'SWEEP':
             edge = self.a.x_max if self.x_direction > 0 else self.a.x_min
             self.x = approach(self.x, edge, step)
@@ -96,12 +113,11 @@ class SnakePath:
                     self.y_direction = 1
                 self.row_target = min(self.a.y_max, max(self.a.y_min,
                     self.y + self.y_direction * self.a.scan_step))
-                self.phase = 'ROW'
+                self.pending_phase = 'ROW'
         else:
             self.y = approach(self.y, self.row_target, step)
             if self.y == self.row_target:
-                self.x_direction *= -1
-                self.phase = 'SWEEP'
+                self.pending_phase = 'SWEEP'
 
 
 def open_board(port, arduino_class=None):
@@ -181,8 +197,9 @@ class ServoRig:
             raise
 
     def write(self, x, y, now):
+        """True: текущая позиция отправлена или уже была задана ранее."""
         if now - self.last_time < 1 / self.args.servo_hz:
-            return
+            return False
         angles = (servo_angle(x, self.args.x_min, self.args.x_max),
                   servo_angle(y, self.args.y_min, self.args.y_max))
         if self.pins:
@@ -194,6 +211,7 @@ class ServoRig:
                         raise RuntimeError(f'Arduino {self.port}: запись угла {angles[index]}° '
                                            f'на pin {9 + index} не выполнена: {exc}') from exc
         self.last_command, self.last_time = angles, now
+        return True
 
     def close(self):
         if self.board:
@@ -216,11 +234,13 @@ def run(args):
             dt = min(.1, max(0, now-previous))
             previous = now
             path.scan(dt)
-            rig.write(path.x,path.y,now)
+            if rig.write(path.x, path.y, now):
+                path.position_sent()
             if now-last_report >= 1:
                 print(f'{path.phase}: X={path.x:.1f}° | Y={path.y:.1f}°', flush=True)
                 last_report = now
-            sleep(1 / (2*args.servo_hz))
+            # Расчёт пути остаётся частым даже при редкой отправке команд.
+            sleep(min(.05, 1 / (2 * args.servo_hz)))
     finally:
         rig.close()
         print('Проверка завершена.', flush=True)

@@ -84,10 +84,24 @@ class ServoSweepTests(unittest.TestCase):
         for _ in range(1000):
             previous=path.phase
             path.scan(.05)
+            path.position_sent()
             self.assertTrue(80 <= path.x <= 100 and 80 <= path.y <= 100)
             if previous != 'SWEEP' and path.phase == 'SWEEP':
                 rows.append((path.y,path.x_direction))
         self.assertEqual(rows[:5],[(80,1),(90,-1),(100,1),(90,-1),(80,1)])
+
+    def test_corner_waits_for_command_before_changing_axis(self):
+        path = sweep.SnakePath(sweep.parse_args([]))
+        path.phase = 'SWEEP'
+        path.x, path.y = 139,55
+        path.scan(.1)
+        self.assertEqual((path.x,path.y,path.pending_phase),(140,55,'ROW'))
+        for _ in range(10):
+            path.scan(.1)
+        self.assertEqual((path.x,path.y),(140,55))
+        path.position_sent()
+        path.scan(.1)
+        self.assertEqual((path.x,path.y),(140,57))
 
     def test_port_selection_and_ambiguity(self):
         uno=SimpleNamespace(device='/dev/ttyACM1',vid=0x2341,pid=0x0043)

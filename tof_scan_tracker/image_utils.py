@@ -13,7 +13,10 @@ def annotate_fragment(image, fragment):
     if fragment is None:
         lines = ("No fragment", "Check thresholds / min-area")
     else:
-        contours, _ = cv2.findContours(fragment["mask"].astype(np.uint8),
+        # Полная маска нужна только для выбранной цели, а не для всех кандидатов.
+        mask = np.zeros(image.shape[:2], np.uint8)
+        mask.flat[fragment['indices']] = 1
+        contours, _ = cv2.findContours(mask,
                                       cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(image, contours, -1, (255, 255, 255), 1)
         lines = (f"Area: {fragment['area']} px | D: {fragment['distance']:.1f} mm",
