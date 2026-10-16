@@ -19,6 +19,7 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "clue" / "data"
 def load_image(path, *, depth=False):
     """Вернуть RGB-картинку для просмотра и описание исходных данных."""
     data = np.load(path, allow_pickle=False)
+    # print(data.shape)
     if data.ndim != 2 or not data.size or data.dtype.kind not in "uif":
         raise ValueError(f"{path.name}: ожидается непустой двумерный числовой массив")
 
@@ -53,6 +54,8 @@ def main():
     try:
         images = [load_image(DATA_DIR / "depth.npy", depth=True),
                   load_image(DATA_DIR / "confidence.npy")]
+        print(images[0][0].size)
+        print(images[1][0].size)
     except Exception as exc:
         messagebox.showerror("Не удалось открыть изображения", f"{DATA_DIR}\n\n{exc}", parent=root)
         root.destroy()
