@@ -39,7 +39,8 @@ def parse_args(argv=None):
     p.add_argument('--min-area', type=int, default=80, help='Минимальная площадь, пиксели')
     p.add_argument('--port', default='auto', help='Порт Arduino или auto для автоматического поиска')
     p.add_argument('--scan-only', action='store_true', help='Только сканирование змейкой, без слежения')
-    p.add_argument('--invert-x', action='store_true', help='Обратить направление слежения по X')
+    p.add_argument('--invert-x', action=argparse.BooleanOptionalAction, default=True,
+                   help='Инверсия слежения по X для текущего монтажа; отключение: --no-invert-x')
     p.add_argument('--invert-y', action='store_true', help='Обратить направление слежения по Y')
     p.add_argument('--no-servos', action='store_true', help='Камера и расчёт углов без подключения Arduino')
     a = p.parse_args(argv)

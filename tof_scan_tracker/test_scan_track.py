@@ -20,6 +20,8 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual((a.min, a.max, a.confidence, a.lost_timeout), (400, 500, 200, 3))
         self.assertEqual(a.port, 'auto')
         self.assertFalse(a.scan_only)
+        self.assertTrue(a.invert_x)
+        self.assertFalse(a.invert_y)
 
     def test_scan_only_ignores_visible_targets(self):
         t = ScanTracker(parse_args(['--scan-only']))
@@ -68,16 +70,24 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual(t.state, 'WAIT')
 
     def test_tracking_direction_inversion_and_deadzone(self):
-        for flags, sign in (([], 1), (['--invert-x', '--invert-y'], -1)):
+        for flags, sign_x, sign_y in (([], -1, 1),
+                                      (['--no-invert-x', '--invert-y'], 1, -1)):
             t = ScanTracker(parse_args(flags))
             t.update([target(.8,.8)], 0)
             t.update([target(.8,.8)], .1)
-            self.assertGreater(sign*(t.x-90), 0)
-            self.assertGreater(sign*(t.y-90), 0)
+            self.assertGreater(sign_x*(t.x-90), 0)
+            self.assertGreater(sign_y*(t.y-90), 0)
         t = ScanTracker(parse_args([]))
         t.update([target(.52,.48)], 0)
         t.update([target(.52,.48)], .1)
         self.assertEqual((t.x,t.y), (90,90))
+
+    def test_default_x_direction_for_target_on_left(self):
+        t = ScanTracker(parse_args([]))
+        t.update([target(.2, .5)], 0)
+        t.update([target(.2, .5)], .1)
+        self.assertGreater(t.x, 90)
+        self.assertEqual(t.y, 90)
 
     def test_snake_rows_reverse_and_angles_bounded(self):
         a = parse_args(['--x-min','80','--x-max','100','--y-min','80','--y-max','100'])
