@@ -36,10 +36,24 @@ def parse_args(argv=None):
     return args
 
 
+def valid_mask(depth, confidence, threshold, minimum, maximum):
+    return (np.isfinite(depth) & np.isfinite(confidence) & (depth > 0)
+             & (confidence >= threshold) & (depth >= minimum) & (depth <= maximum))
+
+
+def nearest_point(depth, confidence, threshold, minimum, maximum):
+    """Расстояние и confidence одной ближайшей валидной точки или None."""
+    valid = valid_mask(depth, confidence, threshold, minimum, maximum)
+    if not valid.any():
+        return None
+    index = np.argmin(np.where(valid, depth, np.inf))
+    # Python-числа не зависят от памяти SDK после releaseFrame.
+    return float(depth.flat[index]), float(confidence.flat[index])
+
+
 def render_depth(depth, confidence, threshold, minimum, maximum):
     """Отсечение и цветное BGR-изображение; исходные массивы не меняются."""
-    valid = (np.isfinite(depth) & np.isfinite(confidence) & (depth > 0)
-             & (confidence >= threshold) & (depth >= minimum) & (depth <= maximum))
+    valid = valid_mask(depth, confidence, threshold, minimum, maximum)
     # Цветовая шкала фиксирована по аргументам, не меняется между кадрами.
     scaled = (np.where(valid, depth, minimum) - minimum) * (255.0 / (maximum - minimum))
     gray = np.clip(scaled, 0, 255).astype(np.uint8)
@@ -81,6 +95,7 @@ def run(args, sdk=None):
               "Выход: Q или Esc.", flush=True)
         last_received = monotonic()
         fps_start = last_received
+        last_report = None
         count = 0
         while True:
             # Один последовательный цикл без очереди кадров, процессов и
@@ -101,9 +116,21 @@ def run(args, sdk=None):
                     # Итоговое цветное изображение имеет собственную память.
                     image = render_depth(depth, confidence, args.confidence,
                                          args.min_depth, args.max_depth)
+                    report_due = last_report is None or monotonic() - last_report >= 1
+                    if report_due:
+                        nearest = nearest_point(depth, confidence, args.confidence,
+                                                args.min_depth, args.max_depth)
                 finally:
                     camera.releaseFrame(frame)
                 last_received = monotonic()
+                if report_due:
+                    if nearest is None:
+                        print("Ближайшая точка: нет точек, прошедших фильтры", flush=True)
+                    else:
+                        distance, point_confidence = nearest
+                        print(f"Ближайшая точка: {distance:.1f} мм | confidence: {point_confidence:.2f}",
+                              flush=True)
+                    last_report = last_received
                 cv2.imshow(window, image)
                 count += 1
                 if last_received - fps_start >= 2:
