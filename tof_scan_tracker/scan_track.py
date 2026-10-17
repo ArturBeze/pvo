@@ -41,7 +41,8 @@ def parse_args(argv=None):
     p.add_argument('--scan-only', action='store_true', help='Только сканирование змейкой, без слежения')
     p.add_argument('--invert-x', action=argparse.BooleanOptionalAction, default=True,
                    help='Инверсия слежения по X для текущего монтажа; отключение: --no-invert-x')
-    p.add_argument('--invert-y', action='store_true', help='Обратить направление слежения по Y')
+    p.add_argument('--invert-y', action=argparse.BooleanOptionalAction, default=True,
+                   help='Инверсия слежения по Y; отключение: --no-invert-y')
     p.add_argument('--no-servos', action='store_true', help='Камера и расчёт углов без подключения Arduino')
     a = p.parse_args(argv)
     if any(isinstance(v, float) and not math.isfinite(v) for v in vars(a).values()):

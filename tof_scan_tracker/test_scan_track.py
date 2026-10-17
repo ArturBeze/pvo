@@ -23,7 +23,7 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual(a.port, 'auto')
         self.assertFalse(a.scan_only)
         self.assertTrue(a.invert_x)
-        self.assertFalse(a.invert_y)
+        self.assertTrue(a.invert_y)
 
     def test_scan_only_ignores_visible_targets(self):
         t = ScanTracker(parse_args(['--scan-only']))
@@ -72,8 +72,8 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual(t.state, 'WAIT')
 
     def test_tracking_direction_inversion_and_deadzone(self):
-        for flags, sign_x, sign_y in (([], -1, 1),
-                                      (['--no-invert-x', '--invert-y'], 1, -1)):
+        for flags, sign_x, sign_y in (([], -1, -1),
+                                      (['--no-invert-x', '--no-invert-y'], 1, 1)):
             t = ScanTracker(parse_args(flags))
             t.y = 110
             t.update([target(.8,.8)], 0)
