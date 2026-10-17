@@ -70,7 +70,7 @@ class ServoSweepTests(unittest.TestCase):
     def test_defaults_and_reject_invalid_arguments(self):
         args = sweep.parse_args([])
         self.assertEqual((args.port,args.x_min,args.x_max,args.y_min,args.y_max),
-                         ('auto',40,140,55,125))
+                         ('auto',60,120,90,140))
         for flags in (['--scan-speed','nan'], ['--servo-hz','0'],
                       ['--x-min','19'], ['--y-max','151'],
                       ['--x-min','80.1','--x-max','80.9']):
@@ -93,15 +93,15 @@ class ServoSweepTests(unittest.TestCase):
     def test_corner_waits_for_command_before_changing_axis(self):
         path = sweep.SnakePath(sweep.parse_args([]))
         path.phase = 'SWEEP'
-        path.x, path.y = 139,55
+        path.x, path.y = 119,90
         path.scan(.1)
-        self.assertEqual((path.x,path.y,path.pending_phase),(140,55,'ROW'))
+        self.assertEqual((path.x,path.y,path.pending_phase),(120,90,'ROW'))
         for _ in range(10):
             path.scan(.1)
-        self.assertEqual((path.x,path.y),(140,55))
+        self.assertEqual((path.x,path.y),(120,90))
         path.position_sent()
         path.scan(.1)
-        self.assertEqual((path.x,path.y),(140,57))
+        self.assertEqual((path.x,path.y),(120,92))
 
     def test_port_selection_and_ambiguity(self):
         uno=SimpleNamespace(device='/dev/ttyACM1',vid=0x2341,pid=0x0043)
@@ -123,10 +123,10 @@ class ServoSweepTests(unittest.TestCase):
         rig.write(0,200,0)
         rig.write(90,90,.01)
         board.digital[9].write.assert_called_once_with(81)
-        board.digital[10].write.assert_called_once_with(125)
+        board.digital[10].write.assert_called_once_with(140)
         rig.write(200,0,.1)
         board.digital[9].write.assert_called_with(100)
-        board.digital[10].write.assert_called_with(55)
+        board.digital[10].write.assert_called_with(90)
         rig.write(200,0,.2)
         self.assertEqual(board.digital[9].write.call_count,2)
 

@@ -19,7 +19,7 @@ class TrackerTests(unittest.TestCase):
         a = parse_args([])
         self.assertEqual((a.gain,a.track_speed,a.dead_zone,a.servo_hz), (60,80,.05,30))
         self.assertEqual((a.min, a.max, a.confidence, a.lost_timeout), (400, 500, 200, 3))
-        self.assertEqual((a.x_min,a.x_max,a.y_min,a.y_max), (40,140,55,125))
+        self.assertEqual((a.x_min,a.x_max,a.y_min,a.y_max), (60,120,90,140))
         self.assertEqual(a.port, 'auto')
         self.assertFalse(a.scan_only)
         self.assertTrue(a.invert_x)
@@ -75,10 +75,11 @@ class TrackerTests(unittest.TestCase):
         for flags, sign_x, sign_y in (([], -1, 1),
                                       (['--no-invert-x', '--invert-y'], 1, -1)):
             t = ScanTracker(parse_args(flags))
+            t.y = 110
             t.update([target(.8,.8)], 0)
             t.update([target(.8,.8)], .1)
             self.assertGreater(sign_x*(t.x-90), 0)
-            self.assertGreater(sign_y*(t.y-90), 0)
+            self.assertGreater(sign_y*(t.y-110), 0)
         t = ScanTracker(parse_args([]))
         t.update([target(.52,.48)], 0)
         t.update([target(.52,.48)], .1)
@@ -179,10 +180,10 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual(board.config,[(9,90),(10,90)])
         rig.write(-100,500,0)
         rig.write(90,90,.01)
-        self.assertEqual(board.digital[9].values,[40])
-        self.assertEqual(board.digital[10].values,[125])
+        self.assertEqual(board.digital[9].values,[60])
+        self.assertEqual(board.digital[10].values,[140])
         rig.write(90,90,.1)
-        self.assertEqual(board.digital[9].values,[40,90])
+        self.assertEqual(board.digital[9].values,[60,90])
         rig.close()
         self.assertTrue(board.closed)
 
@@ -241,9 +242,9 @@ class TrackerTests(unittest.TestCase):
                 if tracker.phase != 'HOME':
                     commands.append(rig.last_command)
                 tracker.position_sent()
-        self.assertIn((140,55),commands)
-        self.assertIn((140,65),commands)
-        self.assertIn((40,65),commands)
+        self.assertIn((120,90),commands)
+        self.assertIn((120,100),commands)
+        self.assertIn((60,100),commands)
         for first, second in zip(commands,commands[1:]):
             self.assertTrue(first[0] == second[0] or first[1] == second[1],
                             f'Диагональная команда: {first} -> {second}')
