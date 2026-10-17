@@ -15,6 +15,22 @@ def target(x=.5, y=.5, distance=450, area=100):
 
 
 class TrackerTests(unittest.TestCase):
+    def test_target_above_moves_logical_y_up_and_raw_servo_angle_down(self):
+        for flags in ([], ['--no-invert-y']):
+            args = parse_args(flags + ['--no-servos'])
+            tracker, rig = ScanTracker(args), ServoRig(args)
+            tracker.y = 110
+            rig.write(tracker.x,tracker.y,0)
+            previous_raw = rig.last_command[1]
+            tracker.update([target(.5,.2)],0)
+            tracker.update([target(.5,.2)],.1)
+            rig.write(tracker.x,tracker.y,.1)
+            self.assertGreater(tracker.y,110)
+            if args.invert_y:
+                self.assertLess(rig.last_command[1],previous_raw)
+            else:
+                self.assertGreater(rig.last_command[1],previous_raw)
+
     def test_defaults(self):
         a = parse_args([])
         self.assertEqual((a.gain,a.track_speed,a.dead_zone,a.servo_hz), (60,80,.05,30))
@@ -73,7 +89,7 @@ class TrackerTests(unittest.TestCase):
 
     def test_tracking_direction_inversion_and_deadzone(self):
         for flags, sign_x, sign_y in (([], -1, -1),
-                                      (['--no-invert-x', '--no-invert-y'], 1, 1)):
+                                      (['--no-invert-x', '--no-invert-y'], 1, -1)):
             t = ScanTracker(parse_args(flags))
             t.y = 110
             t.update([target(.8,.8)], 0)
@@ -177,11 +193,11 @@ class TrackerTests(unittest.TestCase):
         board=Board()
         with patch.object(servo_sweep, 'open_board', return_value=board):
             rig=ServoRig(parse_args(['--port','/dev/test']))
-        self.assertEqual(board.config,[(9,90),(10,90)])
+        self.assertEqual(board.config,[(9,90),(10,140)])
         rig.write(-100,500,0)
         rig.write(90,90,.01)
         self.assertEqual(board.digital[9].values,[60])
-        self.assertEqual(board.digital[10].values,[140])
+        self.assertEqual(board.digital[10].values,[90])
         rig.write(90,90,.1)
         self.assertEqual(board.digital[9].values,[60,90])
         rig.close()
@@ -242,9 +258,9 @@ class TrackerTests(unittest.TestCase):
                 if tracker.phase != 'HOME':
                     commands.append(rig.last_command)
                 tracker.position_sent()
-        self.assertIn((120,90),commands)
-        self.assertIn((120,100),commands)
-        self.assertIn((60,100),commands)
+        self.assertIn((120,140),commands)
+        self.assertIn((120,130),commands)
+        self.assertIn((60,130),commands)
         for first, second in zip(commands,commands[1:]):
             self.assertTrue(first[0] == second[0] or first[1] == second[1],
                             f'Диагональная команда: {first} -> {second}')

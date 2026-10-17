@@ -12,6 +12,8 @@ from time import monotonic, sleep
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument('--port', default='auto', help='Порт Arduino или auto')
+    p.add_argument('--invert-y', action=argparse.BooleanOptionalAction, default=True,
+                   help='Отразить логический Y в угол серво: увеличение Y поднимает камеру')
     for name, default, text in (
         ('x-min',60,'Минимальный угол X'), ('x-max',120,'Максимальный угол X'),
         ('y-min',90,'Минимальный угол Y'), ('y-max',140,'Максимальный угол Y'),
@@ -68,6 +70,19 @@ def approach(current, target, step):
 def servo_angle(value, minimum, maximum):
     """Firmata принимает целые градусы: округление не должно выйти за границы."""
     return max(math.ceil(minimum), min(math.floor(maximum), int(round(value))))
+
+
+def servo_commands(x, y, args):
+    """Логические углы -> целые команды Arduino. Y растёт вверх.
+
+    При текущем монтаже физический угол Y растёт вниз. Отражение применяется
+    ровно один раз здесь, одинаково для инициализации, змейки и слежения.
+    """
+    y = min(args.y_max, max(args.y_min, y))
+    if args.invert_y:
+        y = args.y_min + args.y_max - y
+    return (servo_angle(x, args.x_min, args.x_max),
+            servo_angle(y, args.y_min, args.y_max))
 
 
 class SnakePath:
@@ -187,10 +202,11 @@ class ServoRig:
             # некоторых версиях библиотеки сначала устанавливает угол 0.
             x = min(args.x_max, max(args.x_min, 90))
             y = min(args.y_max, max(args.y_min, 90))
+            command_x, command_y = servo_commands(x, y, args)
             print('Настройка сервопривода X (pin 9)…', flush=True)
-            self.board.servo_config(9, angle=servo_angle(x, args.x_min, args.x_max))
+            self.board.servo_config(9, angle=command_x)
             print('Настройка сервопривода Y (pin 10)…', flush=True)
-            self.board.servo_config(10, angle=servo_angle(y, args.y_min, args.y_max))
+            self.board.servo_config(10, angle=command_y)
             self.pins = self.board.digital[9], self.board.digital[10]
         except BaseException:
             self.board.exit()
@@ -200,8 +216,7 @@ class ServoRig:
         """True: текущая позиция отправлена или уже была задана ранее."""
         if now - self.last_time < 1 / self.args.servo_hz:
             return False
-        angles = (servo_angle(x, self.args.x_min, self.args.x_max),
-                  servo_angle(y, self.args.y_min, self.args.y_max))
+        angles = servo_commands(x, y, self.args)
         if self.pins:
             for index, pin in enumerate(self.pins):
                 if self.last_command is None or angles[index] != self.last_command[index]:
@@ -223,7 +238,8 @@ def run(args):
     try:
         print('Только расчёт, Arduino не подключается.' if args.no_servos else
               'Сервоприводы подключены: X=9, Y=10.', flush=True)
-        print('Начальное положение: X=%.0f°, Y=%.0f°. Остановка: Ctrl+C.' % (path.x,path.y), flush=True)
+        print('Начальные логические углы: X=%.0f°, Y=%.0f°. Y растёт вверх. Остановка: Ctrl+C.'
+              % (path.x,path.y), flush=True)
         # Даём приводам время на начальную команду. Нет обратной связи по углу.
         sleep(1)
         previous = monotonic()
@@ -237,7 +253,8 @@ def run(args):
             if rig.write(path.x, path.y, now):
                 path.position_sent()
             if now-last_report >= 1:
-                print(f'{path.phase}: X={path.x:.1f}° | Y={path.y:.1f}°', flush=True)
+                print(f'{path.phase}: X={path.x:.1f}° | Y logical={path.y:.1f}° '
+                      f'| команды серво={rig.last_command}', flush=True)
                 last_report = now
             # Расчёт пути остаётся частым даже при редкой отправке команд.
             sleep(min(.05, 1 / (2 * args.servo_hz)))

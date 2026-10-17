@@ -67,6 +67,33 @@ class ConnectionTests(unittest.TestCase):
 
 
 class ServoSweepTests(unittest.TestCase):
+    def test_y_mapping_matches_mount_and_can_be_disabled(self):
+        args = sweep.parse_args([])
+        self.assertTrue(args.invert_y)
+        self.assertEqual([sweep.servo_commands(90,y,args)[1] for y in (90,100,115,140)],
+                         [140,130,115,90])
+        args = sweep.parse_args(['--no-invert-y'])
+        self.assertEqual([sweep.servo_commands(90,y,args)[1] for y in (90,100,140)],
+                         [90,100,140])
+
+    def test_y_mapping_clamps_before_reflection_and_rounds_inside_limits(self):
+        args = sweep.parse_args(['--y-min','90.6','--y-max','139.4'])
+        for logical in (-100,90.6,100,139.4,500):
+            self.assertTrue(90.6 <= sweep.servo_commands(90,logical,args)[1] <= 139.4)
+        self.assertEqual(sweep.servo_commands(90,-100,args)[1],139)
+        self.assertEqual(sweep.servo_commands(90,500,args)[1],91)
+
+    def test_initialization_and_writes_use_same_y_mapping(self):
+        args = sweep.parse_args(['--port','/dev/test'])
+        board = MagicMock()
+        board.digital = [MagicMock() for _ in range(14)]
+        with patch.object(sweep,'open_board',return_value=board), contextlib.redirect_stdout(io.StringIO()):
+            rig = sweep.ServoRig(args)
+        board.servo_config.assert_any_call(10,angle=140)
+        rig.write(90,90,0)
+        rig.write(90,100,.1)
+        self.assertEqual([call.args[0] for call in board.digital[10].write.call_args_list], [140,130])
+
     def test_defaults_and_reject_invalid_arguments(self):
         args = sweep.parse_args([])
         self.assertEqual((args.port,args.x_min,args.x_max,args.y_min,args.y_max),
@@ -123,10 +150,10 @@ class ServoSweepTests(unittest.TestCase):
         rig.write(0,200,0)
         rig.write(90,90,.01)
         board.digital[9].write.assert_called_once_with(81)
-        board.digital[10].write.assert_called_once_with(140)
+        board.digital[10].write.assert_called_once_with(90)
         rig.write(200,0,.1)
         board.digital[9].write.assert_called_with(100)
-        board.digital[10].write.assert_called_with(90)
+        board.digital[10].write.assert_called_with(140)
         rig.write(200,0,.2)
         self.assertEqual(board.digital[9].write.call_count,2)
 

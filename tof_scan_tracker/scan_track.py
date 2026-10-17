@@ -42,7 +42,7 @@ def parse_args(argv=None):
     p.add_argument('--invert-x', action=argparse.BooleanOptionalAction, default=True,
                    help='Инверсия слежения по X для текущего монтажа; отключение: --no-invert-x')
     p.add_argument('--invert-y', action=argparse.BooleanOptionalAction, default=True,
-                   help='Инверсия слежения по Y; отключение: --no-invert-y')
+                   help='Отражение логического Y в угол серво во всех режимах; отключение: --no-invert-y')
     p.add_argument('--no-servos', action='store_true', help='Камера и расчёт углов без подключения Arduino')
     a = p.parse_args(argv)
     if any(isinstance(v, float) and not math.isfinite(v) for v in vars(a).values()):
@@ -134,7 +134,9 @@ class ScanTracker(SnakePath):
         self.state = 'TRACK'
         axes = (
             ('x', target['center'][0], self.a.invert_x, self.a.x_min, self.a.x_max),
-            ('y', target['center'][1], self.a.invert_y, self.a.y_min, self.a.y_max),
+            # Изображение: Y растёт вниз; логический угол камеры — вверх.
+            # Монтажная инверсия применяется отдельно в ServoRig.
+            ('y', target['center'][1], True, self.a.y_min, self.a.y_max),
         )
         for axis, center, invert, minimum, maximum in axes:
             error = 2 * (center - .5)
@@ -199,7 +201,7 @@ def process_frame(frame, sdk, args, tracker, now, ready_at):
         image = annotate_fragment(image, target)
 
     state = tracker.state if now >= ready_at else 'START'
-    text = f'{state} X:{tracker.x:.0f} Y:{tracker.y:.0f}'
+    text = f'{state} X:{tracker.x:.0f} Y(up):{tracker.y:.0f}'
     if args.scan_only:
         text += ' | scan only'
     if state == 'WAIT':
